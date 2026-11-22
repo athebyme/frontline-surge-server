@@ -1,0 +1,33 @@
+[package]
+name = "frontline-surge-server"
+version = "0.5.0"
+edition = "2021"
+publish = false
+description = "Dedicated multiplayer server for Frontline Surge"
+default-run = "frontline-server"
+
+[lib]
+name = "frontline_surge"
+
+[features]
+default = ["server"]
+server = []
+
+# Shared wire modules use the sibling client repository's feature for decoding.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("client"))'] }
+
+[[bin]]
+name = "frontline-server"
+path = "src/bin/server.rs"
+required-features = ["server"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
