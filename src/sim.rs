@@ -1,8 +1,16 @@
 //! Authoritative fixed-tick team deathmatch. No renderer or network dependencies.
 #[path = "inventory.rs"]
 pub(crate) mod inventory;
+#[path = "build_placement.rs"]
+mod build_placement;
 use crate::arsenal::{Arsenal, FireControl};
 use crate::drone_sim::DroneFleet;
+#[path = "burst.rs"]
+mod burst;
+use burst::Burst;
+#[path = "ground_fragments.rs"]
+mod ground_fragments;
+use crate::fracture::Material;
 use crate::fracture::{Damage, FractureState, Layout};
 use crate::logistics::{Logistics, VehicleSpawn};
 use serde::{Deserialize, Serialize};
@@ -178,6 +186,8 @@ pub(crate) struct Prop {
     pub(crate) layout: Option<Arc<Layout>>,
     #[serde(skip)]
     pub(crate) fracture: FractureState,
+    #[serde(skip)]
+    pub(crate) rubble: Vec<crate::rubble::Piece>,
     pub(crate) kind: String,
     pub(crate) x: f32,
     pub(crate) z: f32,
@@ -323,6 +333,9 @@ impl Prop {
         a * a + b * b
     }
     pub(crate) fn touches(&self, other: &Prop) -> bool {
+        self.overlaps_margin(other, 0.04)
+    }
+    fn overlaps_margin(&self, other: &Prop, margin: f32) -> bool {
         if (self.x - other.x).abs() > self.world_rx + other.world_rx + 0.05
             || (self.z - other.z).abs() > self.world_rz + other.world_rz + 0.05
         {
@@ -341,7 +354,7 @@ impl Prop {
         ]
         .into_iter()
         .all(|(x, z)| {
-            (delta.0 * x + delta.1 * z).abs() < extent(self, x, z) + extent(other, x, z) + 0.04
+            (delta.0 * x + delta.1 * z).abs() < extent(self, x, z) + extent(other, x, z) + margin
         })
     }
     fn local(&self, o: [f32; 3]) -> [f32; 3] {
@@ -495,6 +508,7 @@ struct Input {
     aim: bool,
     shoot: bool,
     secondary: bool,
+    apc_rounds: bool,
 }
 #[derive(Clone, Default, Debug)]
 struct Edges {
@@ -504,6 +518,7 @@ struct Edges {
     build: bool,
     place: bool,
     expected_support: Option<Option<u64>>,
+    expected_preview: Option<u64>,
     trigger: bool,
     vehicle: bool,
     service: bool,
@@ -514,6 +529,8 @@ struct Edges {
     cycle_build: bool,
     grenade: bool,
     drone: bool,
+    drone_link: bool,
+    drone_recall: bool,
     ping: bool,
     pulse: bool,
     cycle_mode: bool,
@@ -529,6 +546,8 @@ pub(crate) struct Player {
     arsenal: Arsenal,
     #[serde(skip)]
     gate: FireControl,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) loose_footing: bool,
     pub(crate) points: u32,
     pub(crate) assists: u32,
     pub(crate) grenades: u32,
@@ -556,6 +575,8 @@ pub(crate) struct Player {
     pub(crate) x: f32,
     pub(crate) z: f32,
     pub(crate) yaw: f32,
+    #[serde(skip)]
+    pub(crate) turret_aim: Option<f32>,
     pub(crate) pitch: f32,
     pub(crate) eye_height: f32,
     pub(crate) hp: f32,
@@ -579,6 +600,8 @@ pub(crate) struct Player {
     pub(crate) damage_yaw: f32,
     pub(crate) build_mode: bool,
     pub(crate) preview: Option<Value>,
+    #[serde(skip)]
+    ghosts: build_placement::History,
     pub(crate) hint: String,
     pub(crate) message: String,
     pub(crate) message_t: f32,
@@ -687,6 +710,8 @@ struct Shell {
     #[serde(skip)]
     name: String,
     vehicle_id: u32,
+    #[serde(skip)]
+    payload: Burst,
     x: f32,
     y: f32,
     z: f32,
@@ -699,9 +724,9 @@ struct Shell {
 enum Strike {
     Infantry,
     Machinegun { vehicle_kind: &'static str },
-    Shell { vehicle: u32, id: u64 },
+    Shell { vehicle: u32, id: u64, payload: Burst },
 }
-const MOUNTED_MG_RANGE: f32 = 180.;
+use crate::vehicle_gun::MG_RANGE as MOUNTED_MG_RANGE;
 #[derive(Clone, Copy, PartialEq)]
 enum Contact {
     Range,
@@ -923,7 +948,9 @@ impl Match {
                 best_score = score - penalty;
             }
         }
+        p.ghosts.clear();
         *p = Player {
+            ghosts: std::mem::take(&mut p.ghosts),
             id: p.id,
             name: std::mem::take(&mut p.name),
             team: std::mem::take(&mut p.team),
@@ -989,6 +1016,8 @@ impl Match {
         }
         p.last_input = self.elapsed;
         p.yaw = (num(input, "yaw", p.yaw, -100000., 100000.) + PI).rem_euclid(TAU) - PI;
+        p.turret_aim = input["turretAim"].as_f64()
+            .filter(|v| v.is_finite() && v.abs() <= 100_000.).map(|v| v as f32);
         p.pitch = num(input, "pitch", p.pitch, -1.28, 1.28);
         let shoot = held(input, "shoot");
         p.edges.trigger |= shoot && !p.control.shoot;
@@ -1001,10 +1030,13 @@ impl Match {
             sprint: held(input, "sprint"),
             aim: held(input, "aim"),
             shoot,
+            apc_rounds: held(input,"apcRounds"),
             secondary: held(input, "secondary") || held(input, "aim"),
         };
         p.edges.grenade |= held(input, "grenade");
         p.edges.drone |= held(input, "drone");
+        p.edges.drone_link |= held(input,"drone") && held(input,"droneLink");
+        p.edges.drone_recall |= held(input,"droneRecall");
         p.edges.ping |= held(input, "ping");
         p.edges.pulse |= held(input, "pulse");
         p.edges.cycle_mode |= held(input, "cycleMode");
@@ -1036,6 +1068,7 @@ impl Match {
         p.edges.build |= held(input, "build");
         if held(input, "place") {
             p.edges.place = true;
+            p.edges.expected_preview = input["previewId"].as_u64();
             p.edges.expected_support = input.get("supportBuildId").map(Value::as_u64);
         }
         p.edges.vehicle |= held(input, "vehicle");
@@ -1127,6 +1160,7 @@ impl Match {
                 }
                 let o = &mut self.props[i];
                 o.dead = false;
+                o.rubble.clear();
                 o.hp = o.max_hp;
                 o.stock = if o.wood_tree() { 3 } else { o.capacity };
                 o.dirty = true;
@@ -1181,7 +1215,11 @@ impl Match {
                 return;
             }
         }
-        self.drones.tick(dt, &self.players);
+        for id in self.drones.tick(dt, &self.players) {
+            if let Some(p) = self.players.get_mut(&id).filter(|p|p.alive) {
+                p.notice("Батарея дрона разряжена · новый через 45 с");
+            }
+        }
         if teams.0 && teams.1 {
             self.remaining = (self.remaining - f64::from(dt)).max(0.);
         }
@@ -1190,6 +1228,7 @@ impl Match {
         }
     }
     fn end_round(&mut self) {
+        self.drones = DroneFleet::default();
         self.phase = "ended";
         self.next_round_in = 10.;
         self.winner = Some(match self.blue.cmp(&self.red) {
@@ -1211,11 +1250,17 @@ impl Match {
         let ctl = p.control.clone();
         let mut action = std::mem::take(&mut p.edges);
         if self.logistics.driver_vehicle(p.id).is_none() {
-            let control = json!({"drone":action.drone,"ping":action.ping,"forward":ctl.forward,"strafe":ctl.strafe,"up":ctl.sprint,"down":ctl.aim});
+            let starting = action.drone && self.drones.aircraft(p.id).is_none();
+            let control = json!({"drone":action.drone,"droneLink":action.drone_link,"droneRecall":action.drone_recall,"ping":action.ping,"forward":ctl.forward,"strafe":ctl.strafe,"up":ctl.sprint,"down":ctl.aim});
             if self
                 .drones
                 .control(p, &control, dt, &self.level.bounds, &self.props)
             {
+                if starting {
+                    if let Some((id, at)) = self.drones.aircraft(p.id) {
+                        self.scene_event("droneLaunch", json!({"actor":p.id,"droneId":id,"x":at[0],"y":at[1],"z":at[2]}));
+                    }
+                }
                 if action.pulse {
                     self.drone_pulse(p);
                 }
@@ -1347,7 +1392,7 @@ impl Match {
             || station_use;
         if wants_ops {
             let cmd = json!({"forward":ctl.forward,"strafe":ctl.strafe,"sprint":ctl.sprint,"yaw":p.yaw,"pitch":p.pitch,"shoot":ctl.shoot||action.trigger,
-                "secondary":ctl.secondary,"vehicle":action.vehicle,"service":action.service,"upgrade":action.upgrade,"ammoCraft":action.ammo_craft,"cargo":action.cargo,"upgradeSelect":action.upgrade_select,"interact":station_use});
+                "secondary":ctl.secondary,"apcRounds":ctl.apc_rounds,"vehicle":action.vehicle,"service":action.service,"upgrade":action.upgrade,"ammoCraft":action.ammo_craft,"cargo":action.cargo,"upgradeSelect":action.upgrade_select,"interact":station_use});
             let effects = self
                 .logistics
                 .update(p, &cmd, dt, &self.props, &self.level.bounds);
@@ -1393,7 +1438,9 @@ impl Match {
             && !ctl.shoot
             && !p.build_mode
             && !p.exhausted;
-        let speed = dt
+        let loose = (ctl.forward != 0. || ctl.strafe != 0.) && self.props.iter().any(|o| o.loose_footing(p.x,p.z));
+        p.loose_footing = loose;
+        let speed = dt * if loose { 0.87 } else { 1. }
             * kit.mobility()
             * p.weapon.stats().mobility
             * (if sprint {
@@ -1435,18 +1482,35 @@ impl Match {
         }
         if p.build_mode {
             p.gate.reset();
-            let (wall, support, clear) = self.preview(p);
+            let mut shown = self.build_preview(p);
+            let mut stale = false;
+            if let Some(id) = action.expected_preview {
+                if let Some(old) = p.ghosts.find(id, self.elapsed) {
+                    if !self.restore_preview(p, &mut shown, old) { stale = true; }
+                } else { stale = true; }
+            }
+            let build_placement::Preview {wall, support, joint, clear} = shown;
             let support_id = support.and_then(|i| self.props[i].build_id);
             let base_y = support.map_or(0., |i| self.props[i].h);
             let (wood, metal) = Self::build_cost(&wall.kind);
             let has_space = support.is_some() || self.team_build_room(&p.team);
             let valid = clear && has_space && p.wood >= wood && p.metal >= metal;
+            let pose = build_placement::Pose::new(&wall, support_id, joint);
+            let preview_id = p.ghosts.remember(pose, self.elapsed);
             p.preview = Some(
-                json!({"kind":wall.kind,"x":wall.x,"y":base_y,"z":wall.z,"yaw":wall.yaw,"w":wall.w,"h":wall.h,"d":wall.d,
+                json!({"previewId":preview_id,"kind":wall.kind,"x":wall.x,"y":base_y,"z":wall.z,"yaw":wall.yaw,"w":wall.w,"h":wall.h,"d":wall.d,
                 "level":wall.level,"team":wall.team,"supportBuildId":support_id,"valid":valid,"clear":clear,"teamLimit":!has_space}),
             );
+            if let Some(j) = joint {
+                let out = p.preview.as_mut().unwrap();
+                out["snapKind"] = j.kind.into();
+                out["snapBuildId"] = j.id.into();
+                out["snapPoint"] = json!([j.x, 0., j.z]);
+            }
             if action.place {
-                if action.expected_support.is_some_and(|id| id != support_id.map(u64::from)) {
+                if stale {
+                    p.notice("Место изменилось · проверь новый контур");
+                } else if action.expected_support.is_some_and(|id| id != support_id.map(u64::from)) {
                     p.notice("Опора изменилась");
                 } else if !has_space {
                     p.notice("Лимит команды · 64 постройки");
@@ -1471,6 +1535,7 @@ impl Match {
                         p.metal -= metal;
                         p.build_mode = false;
                         p.preview = None;
+                        p.ghosts.clear();
                         p.hold_trigger = ctl.shoot;
                         self.event("build",p,json!({"buildKind":kind,"index":slot,"buildId":self.props[slot].build_id}));
                         p.notice("Постройка готова");
@@ -1481,6 +1546,7 @@ impl Match {
             }
         } else {
             p.preview = None;
+            p.ghosts.clear();
             if p.gate.ready(
                 ctl.shoot,
                 action.trigger,
@@ -1617,7 +1683,7 @@ impl Match {
             return false;
         }
         let (weapon, vehicle_kind) = match kind {
-            Strike::Shell { .. } => ("tank", Some("mbt")),
+            Strike::Shell { payload, .. } => (payload.weapon(), payload.vehicle()),
             Strike::Machinegun { vehicle_kind } => ("vehicle_mg", Some(vehicle_kind)),
             Strike::Infantry => (p.weapon.name(), None),
         };
@@ -1630,22 +1696,29 @@ impl Match {
                 if matches!(obj.style.as_deref(), Some("shippingContainer" | "tankBattery"))
                     || matches!(obj.kind.as_str(), "patrol4x4" | "cargo6x6" | "mbt" | "apc" | "scout_buggy") {
                     Some("metal")
-                } else {
-                    Some(obj.kind.as_str())
-                }
+                } else if let Some(layout)=&obj.layout {
+                    let local=obj.local(end);
+                    layout.surface_material(&obj.fracture, local).map(|mat| match mat {
+                        Material::Wood=>"plank",Material::Brick=>"brick",Material::Stone=>"stone",Material::Metal=>"metal",Material::Tile=>"tile",
+                    })
+                } else {Some(obj.kind.as_str())}
             }
             _ => None,
         };
         if let Some(material) = material {
             info["impactMaterial"] = material.into();
         }
-        if let Strike::Shell { id, vehicle } = kind {
+        if let Strike::Shell { id, vehicle, payload } = kind {
             info["shellId"] = id.into();
             info["vehicleId"] = vehicle.into();
             info["x"] = end[0].into();
             info["y"] = end[1].into();
             info["z"] = end[2].into();
             self.scene_event("shellImpact", info);
+            // The contact can lie exactly on a wall face. Resolve splash on its
+            // incident side while the hit wall still shields its other side.
+            let origin = std::array::from_fn(|k| end[k] - d[k] * 0.025);
+            self.apply_burst(p, origin, payload, Some(surface));
         } else {
             self.scene_event("shot", info);
         }
@@ -1671,7 +1744,7 @@ impl Match {
             );
         } else if let Contact::Drone(id) = surface {
             p.hit_confirm = 1.;
-            if self.drones.hit(
+            if let Some(owner) = self.drones.hit(
                 id,
                 if tank {
                     135.0
@@ -1681,7 +1754,8 @@ impl Match {
                     stats.damage(best, false)
                 },
             ) {
-                self.scene_event("droneDown",json!({"droneId":id,"actor":p.id,"team":p.team,"x":end[0],"y":end[1],"z":end[2]}));
+                if let Some(pilot)=self.players.get_mut(&owner) {pilot.notice("Дрон сбит · новый через 45 с");}
+                self.scene_event("droneDown",json!({"droneId":id,"owner":owner,"actor":p.id,"team":p.team,"x":end[0],"y":end[1],"z":end[2]}));
             } else {
                 self.event("hit", p, json!({"droneId":id,"weapon":weapon}));
             }
@@ -1695,7 +1769,9 @@ impl Match {
                 self.logistics.hull_kind(key).unwrap_or(""),
                 None,
                 d,
-                if tank {
+                if matches!(kind, Strike::Shell { payload: Burst::Apc, .. }) {
+                    57.
+                } else if tank {
                     135.
                 } else if mg {
                     11.
@@ -1706,7 +1782,9 @@ impl Match {
             let events = self.logistics.hit(key, impact, p.id, &p.team);
             self.ingest_logistics(events, p);
         } else if let Contact::Prop(i) = surface {
-            if tank {
+            if matches!(kind, Strike::Shell { payload: Burst::Apc, .. }) {
+                self.damage_prop(i, end, Damage::Grenade, 65., p);
+            } else if tank {
                 self.damage_prop(i, end, Damage::Tank, 155., p);
             } else if self.props[i].layout.is_some() {
                 self.damage_prop(i, end, Damage::Bullet(stats.hard), 0., p);
@@ -1794,6 +1872,7 @@ impl Match {
             if !delta.touched {
                 return;
             }
+            if !delta.removed.is_empty() { obj.rebuild_rubble(); }
             let gone = obj.fracture.broken.len();
             // HP reflects patchable wear; cell occupancy decides whether a wall
             // still blocks movement, shots and sight. Only an empty layout dies.
@@ -1835,7 +1914,7 @@ impl Match {
         }
     }
 
-    fn launch_shell(&mut self, p: &Player, o: [f32; 3], yaw: f32, pitch: f32, vehicle_id: u32) {
+    fn launch_shell(&mut self, p: &Player, o: [f32; 3], yaw: f32, pitch: f32, vehicle_id: u32, payload: Burst) {
         let (sp, cp) = pitch.sin_cos();
         let (sy, cy) = yaw.sin_cos();
         let shell = Shell {
@@ -1844,6 +1923,7 @@ impl Match {
             team: p.team.clone(),
             name: p.name.clone(),
             vehicle_id,
+            payload,
             x: o[0],
             y: o[1],
             z: o[2],
@@ -1879,6 +1959,7 @@ impl Match {
                     Strike::Shell {
                         vehicle: s.vehicle_id,
                         id: s.id,
+                        payload: s.payload,
                     },
                 );
             if !absent {
@@ -1966,27 +2047,6 @@ impl Match {
             }
         }
     }
-    fn blast_clear(
-        &self,
-        o: [f32; 3],
-        target: [f32; 3],
-        allow_prop: Option<usize>,
-        allow_vehicle: Option<usize>,
-    ) -> bool {
-        let delta = [target[0] - o[0], target[1] - o[1], target[2] - o[2]];
-        let range = delta[0].hypot(delta[1]).hypot(delta[2]);
-        if range < 0.08 {
-            return true;
-        }
-        let dir = delta.map(|v| v / range);
-        let (hit, _) = self.ray(o, dir, range - 0.04);
-        if hit.is_some() && hit != allow_prop {
-            return false;
-        }
-        self.logistics
-            .ray(o, dir, range - 0.04, None)
-            .map_or(true, |(k, _)| Some(k) == allow_vehicle)
-    }
     fn explode(&mut self, g: Grenade) {
         let o = [g.x, g.y, g.z];
         self.scene_event(
@@ -2001,94 +2061,7 @@ impl Match {
             name: "Боец".into(),
             ..Default::default()
         });
-        // Compute visibility against the pre-blast scene. A wall broken by this
-        // very explosion still shelters characters on its far side for that hit.
-        let mut victims = vec![];
-        for (&id, q) in &self.players {
-            if !q.alive || q.team == g.team || self.logistics.driver_vehicle(id).is_some() {
-                continue;
-            }
-            let target = [q.x, 0.95, q.z];
-            let dist = (q.x - g.x).hypot(q.z - g.z).hypot(target[1] - g.y);
-            if dist < 6.3 && self.blast_clear(o, target, None, None) {
-                victims.push((id, (124. - dist * 17.5).max(0.)));
-            }
-        }
-        let mut objects = vec![];
-        for (i, obj) in self.props.iter().enumerate() {
-            if obj.dead || (!obj.solid) || obj.footprint(g.x, g.z) > 3.6 * 3.6 {
-                continue;
-            }
-            let local = obj.local(o);
-            let clamp_box = |c: [f32; 3], e: [f32; 3]| {
-                [
-                    local[0].clamp(c[0] - e[0] * 0.5, c[0] + e[0] * 0.5),
-                    local[1].clamp(c[1] - e[1] * 0.5, c[1] + e[1] * 0.5),
-                    local[2].clamp(c[2] - e[2] * 0.5, c[2] + e[2] * 0.5),
-                ]
-            };
-            let dist = |a: [f32; 3]| {
-                (a[0] - local[0])
-                    .hypot(a[2] - local[2])
-                    .hypot(a[1] - local[1])
-            };
-            let near = if let Some(layout) = &obj.layout {
-                layout
-                    .cells
-                    .iter()
-                    .enumerate()
-                    .filter(|(n, _)| !obj.fracture.broken.contains(&(*n as u16)))
-                    .map(|(_, c)| clamp_box(c.center, c.size))
-                    .min_by(|a, b| dist(*a).total_cmp(&dist(*b)))
-            } else {
-                Some(clamp_box(
-                    [0., obj.h * 0.5, 0.],
-                    [
-                        obj.collision_w.unwrap_or(obj.w),
-                        obj.h,
-                        obj.collision_d.unwrap_or(obj.d),
-                    ],
-                ))
-            };
-            if let Some(a) = near {
-                let distance = dist(a);
-                if distance < 3.6 {
-                    let at = [
-                        obj.x + obj.cs * a[0] - obj.sn * a[2],
-                        a[1],
-                        obj.z + obj.sn * a[0] + obj.cs * a[2],
-                    ];
-                    if self.blast_clear(o, at, Some(i), None) {
-                        objects.push((i, obj.build_id, at, 90. - distance * 14.));
-                    }
-                }
-            }
-        }
-        let hulls: Vec<_> = self
-            .logistics
-            .blast_targets(g.x, g.z, 5.0)
-            .into_iter()
-            .filter(|(i, x, y, z)| self.blast_clear(o, [*x, *y, *z], None, Some(*i)))
-            .collect();
-        for (id, amount) in victims {
-            self.harm(&mut p, id, amount, "grenade", false, None);
-        }
-        for (i, x, y, z) in hulls {
-            let dist = (x - g.x).hypot(z - g.z).hypot(y - g.y);
-            let impact = object_damage(
-                self.logistics.hull_kind(i).unwrap_or(""),
-                None,
-                Damage::Grenade,
-                (86. - dist * 12.).max(0.),
-            );
-            let ev = self.logistics.hit(i, impact, g.actor, &g.team);
-            self.ingest_logistics(ev, &mut p);
-        }
-        for (i, expected, at, hp) in objects {
-            if self.props[i].build_id == expected {
-                self.damage_prop(i, at, Damage::Grenade, hp, &p);
-            }
-        }
+        self.apply_burst(&mut p, o, Burst::Grenade, None);
         if !absent {
             self.players.insert(p.id, p);
         }
@@ -2142,8 +2115,9 @@ impl Match {
                 let yaw = num(&ev, "yaw", p.yaw, -10000., 10000.);
                 let pitch = num(&ev, "pitch", p.pitch, -1.45, 1.45);
                 let vid = ev["vehicleId"].as_u64().unwrap_or_default() as u32;
+                let payload = if ev["weapon"] == "apc_he" { Burst::Apc } else { Burst::Tank };
                 self.scene_event(&kind, ev);
-                self.launch_shell(p, origin, yaw, pitch, vid);
+                self.launch_shell(p, origin, yaw, pitch, vid, payload);
             } else {
                 self.scene_event(&kind, ev);
             }
@@ -2213,6 +2187,7 @@ impl Match {
         }
         self.logistics.forget_site(i);
         self.props[i].dead = true;
+        self.props[i].rebuild_rubble();
         self.props[i].dirty = true;
         self.nav = None;
         if i < self.level.props.len() {
@@ -2296,87 +2271,6 @@ impl Match {
             && q.fracture.broken.is_empty()
             && self.logistics.ray(eye, direction, distance, None).is_none())
         .then_some(i)
-    }
-    fn preview(&self, p: &Player) -> (Prop, Option<usize>, bool) {
-        let (sn, cs) = p.yaw.sin_cos();
-        let kind = p.build_kind.as_str();
-        let (w, d, h, hp) = match kind {
-            "refinery" => (3.3, 2.6, 3.1, 260.),
-            "workshop" => (3.8, 3., 2.5, 300.),
-            _ => (3.1, 0.6, 1.33, 140.),
-        };
-        let gap = 2.2 + d * 0.5;
-        let mut build = Prop {
-            kind: if kind == "wall" { "barricade" } else { kind }.into(),
-            x: p.x + sn * gap,
-            z: p.z - cs * gap,
-            yaw: p.yaw,
-            w,
-            d,
-            h,
-            solid: true,
-            built: true,
-            team: Some(p.team.clone()),
-            hp: Some(hp),
-            max_hp: Some(hp),
-            ..Default::default()
-        };
-        let support = if kind == "wall" {
-            self.wall_support(p)
-        } else {
-            None
-        };
-        build.level = 1;
-        if let Some(i) = support {
-            let base = &self.props[i];
-            build.x = base.x;
-            build.z = base.z;
-            build.yaw = base.yaw;
-            build.level = 2;
-        }
-        build.prepare_geometry();
-        let b = &self.level.bounds;
-        let mut clear = build.x - build.world_rx >= b.min_x
-            && build.x + build.world_rx <= b.max_x
-            && build.z - build.world_rz >= b.min_z
-            && build.z + build.world_rz <= b.max_z
-            && self
-                .level
-                .team_spawns
-                .values()
-                .flatten()
-                .all(|sp| (sp.x - build.x).hypot(sp.z - build.z) >= 2.5 - 1e-5)
-            && self
-                .players
-                .values()
-                .all(|q| !q.alive || !build.intersects(q.x, q.z, RADIUS + 0.04))
-            && self
-                .props
-                .iter()
-                .enumerate()
-                .all(|(i, q)| Some(i) == support || q.dead || !q.solid || !build.touches(q));
-        // Tile the oriented build footprint with small conservative circles for
-        // dynamic vehicle clearance, including long hulls and each corner.
-        let nx = (w / 0.35).ceil() as i32;
-        let nz = (d / 0.35).ceil() as i32;
-        if clear {
-            'tiles: for i in 0..=nx {
-                for j in 0..=nz {
-                    let lx = (i as f32 / nx as f32 - 0.5) * w;
-                    let lz = (j as f32 / nz as f32 - 0.5) * d;
-                    if self.logistics.blocked(
-                        build.x + build.cs * lx - build.sn * lz,
-                        build.z + build.sn * lx + build.cs * lz,
-                        0.24,
-                        None,
-                    ) {
-                        clear = false;
-                        break 'tiles;
-                    }
-                }
-            }
-        }
-        (build, support, clear)
     }
     fn target(&self, p: &Player) -> Option<(usize, &'static str)> {
         let mut nearest = f32::INFINITY;
@@ -2483,6 +2377,7 @@ impl Match {
                 o.fracture = FractureState::default();
                 o.fracture.revision = revision;
                 o.fracture.broken = keep;
+                o.rebuild_rubble();
                 self.nav = None;
             }
             o.hp = Some((o.hp.unwrap_or(0.) + 85.).min(o.max_hp.unwrap_or(140.)));
@@ -2561,6 +2456,7 @@ impl Match {
             .filter(|(_, p)| p.dirty)
             .map(|(i, p)| {
                 let mut o = json!({"index":i,"dead":p.dead});
+                if !p.rubble.is_empty() { o["rubble"]=json!(p.rubble); }
                 if p.layout.is_some() {
                     o["broken"] = json!(p.fracture.broken);
                     o["revision"] = json!(p.fracture.revision);
@@ -2581,8 +2477,13 @@ impl Match {
         let dynamic: Vec<_> = self.props[static_count..]
             .iter()
             .map(|p| {
-                if p.dead{return json!({"kind":p.kind,"buildId":p.build_id,"dead":true,"hp":0,"stock":0,"revision":p.fracture.revision});}
+                if p.dead {
+                    let mut tombstone=json!({"kind":p.kind,"buildId":p.build_id,"dead":true,"hp":0,"stock":0,"revision":p.fracture.revision});
+                    if !p.rubble.is_empty() {tombstone["rubble"]=json!(p.rubble);}
+                    return tombstone;
+                }
                 let mut o = json!(p);
+                if !p.rubble.is_empty() { o["rubble"]=json!(p.rubble); }
                 if p.layout.is_some() {
                     o["broken"] = json!(p.fracture.broken);
                     o["revision"] = json!(p.fracture.revision);
@@ -2602,6 +2503,7 @@ impl Match {
                 if let Some(mount) = self.logistics.machinegun_ray(p.id, p.pitch) {
                     let sight = self.first_contact(p, mount.origin, mount.direction, MOUNTED_MG_RANGE, None);
                     out["mgSight"] = json!(sight.end);
+                    out["mgOrigin"] = json!(mount.origin);
                 }
                 p.arsenal.publish(p.weapon.slot(), &mut out);
                 out
@@ -2664,23 +2566,75 @@ mod tests {
         m
     }
     #[test]
+    fn continuous_vehicle_turn_commands_survive_wraps_and_hull_maneuvers() {
+        for sign in [-1_f32,1.] {
+            let mut m = vehicle_lane("mbt", json!([]));
+            let mut last = 0.;
+            for tick in 1..=360 {
+                let aim = sign * tick as f32 * 0.29;
+                m.input(1, &json!({"yaw":aim.sin().atan2(aim.cos()),"turretAim":aim,
+                    "forward":0.5,"strafe":sign,"pitch":-0.04}));
+                m.step(0.05);
+                let state = m.snapshot();
+                let turret = state["vehicles"][0]["turretUnwrapped"].as_f64().unwrap() as f32;
+                assert!((turret-last)*sign >= -0.0001);
+                assert!((turret-last).abs() <= crate::vehicle_gun::TURN_RATE * 0.05 + 0.0001);
+                last = turret;
+            }
+            assert!(last.abs() > 3. * TAU);
+            let before = m.snapshot()["vehicles"][0].clone();
+            for _ in 0..12 {
+                m.input(1, &json!({"turretAim":last,"yaw":last.sin().atan2(last.cos()),
+                    "forward":1.,"strafe":-sign,"pitch":-0.04}));
+                m.step(0.05);
+            }
+            let current = m.snapshot()["vehicles"][0].clone();
+            assert_ne!(before["yaw"], current["yaw"]);
+            assert_eq!(before["turretUnwrapped"], current["turretUnwrapped"]);
+        }
+    }
+    #[test]
+    fn a_cover_edge_inside_an_overhanging_barrel_blocks_the_shot() {
+        let mut m = vehicle_lane("mbt", json!([]));
+        // A moving vehicle can pull up to an existing wall at this edge of its
+        // rotated hull. Add the edge after boarding so the fixture has a stable pose.
+        let mut panel: Prop = serde_json::from_value(json!({
+            "kind":"fence","x":-0.265,"z":18.2,"w":1.,"h":3.,"d":0.12,"solid":true
+        })).unwrap();
+        panel.prepare_geometry();
+        m.props.push(panel);
+        advance(&mut m, 2.5);
+        m.input(1, &json!({"yaw":0.,"pitch":0.,"secondary":true}));
+        m.step(0.05);
+        let shot = m.events.iter().rev().find(|e| e["type"]=="shot").unwrap();
+        assert_eq!(shot["impactMaterial"], "fence");
+        let end = shot["ez"].as_f64().unwrap();
+        assert!((end-18.26).abs() < 0.001);
+        assert_eq!(m.snapshot()["players"][0]["mgSight"][2],shot["ez"]);
+    }
+    #[test]
     fn mounted_mg_sight_matches_the_fired_ray_and_names_the_fatal_weapon() {
-        for (kind, input) in [("mbt", "secondary"), ("apc", "shoot")] {
+        for kind in ["mbt", "apc"] {
+            let input = "secondary";
             for range in [7., 28., 74.] {
                 let mut m = vehicle_lane(kind, json!([]));
+                let mount = crate::vehicle_gun::Mount::for_kind(kind).unwrap();
+                let zero = mount.ray(0., 20., 0., 0., 0., true);
                 let target = m.players.get_mut(&2).unwrap();
-                target.x = 0.;
-                target.z = 20. - range;
+                target.x = zero.origin[0];
+                target.z = zero.origin[2] - range;
+                let target_z = target.z;
                 advance(&mut m, 2.5);
-                let pitch = (1.2_f32 - 2.08).atan2(range);
+                // Aim at the upper torso; the near APC target is inside the mount's reach.
+                let pitch = (1.65_f32 - zero.origin[1]).atan2(range);
                 m.input(1, &json!({"yaw":0, "pitch":pitch}));
                 m.step(0.05);
                 let state = m.snapshot();
                 assert!(state["players"][1].get("mgSight").is_none());
                 let sight = &state["players"][0]["mgSight"];
                 let z = sight[2].as_f64().unwrap() as f32;
-                assert!((z - (20. - range + 0.39)).abs() < 0.003);
-                assert!((1.1..1.3).contains(&sight[1].as_f64().unwrap()));
+                assert!((z - (target_z + 0.39)).abs() < 0.003);
+                assert!((1.57..1.75).contains(&sight[1].as_f64().unwrap()));
                 for _ in 0..12 {
                     m.input(1, &json!({input:true, "yaw":0, "pitch":pitch}));
                     m.step(0.05);
@@ -2706,6 +2660,9 @@ mod tests {
         }
         advance(&mut m, 2.5);
         for (yaw, pitch, material) in [(0., -0.03, "fence"), (1.5, -0.68, "earth")] {
+            if material == "earth" {
+                m.props[0].dead = true;
+            }
             m.input(1, &json!({"yaw":yaw,"pitch":pitch}));
             m.step(0.05);
             let state = m.snapshot();
@@ -2832,6 +2789,59 @@ mod tests {
             .any(|o| o.debris_source == Some(0) && o.kind == "logs" && o.stock == 1));
     }
     #[test]
+    fn shell_area_hits_near_misses_and_stops_at_intact_cover_for_each_payload() {
+        for payload in [Burst::Tank,Burst::Apc] {
+            let mut m=skirmish(json!([{"kind":"wall","x":0.,"z":0.,"w":5.,"h":2.8,"d":0.6,"solid":true,"hp":450.}]));
+            m.add_player(3,"Ally");
+            m.add_player(4,"Behind cover");
+            m.add_player(5,"Allied bystander");
+            m.add_player(6,"Outside range");
+            for (id,x,z) in [(2,0.4,1.0),(3,0.5,1.2),(4,0.4,-1.0),(6,12.,4.)] {
+                let q=m.players.get_mut(&id).unwrap();q.x=x;q.z=z;q.shield=0.;
+            }
+            // Wall hit is displaced horizontally from the nearby player's capsule.
+            let mut shooter=m.players.remove(&1).unwrap();
+            m.trace_shot(&mut shooter,[-0.15,0.95,3.],[0.,0.,-1.],5.,Strike::Shell{vehicle:91,id:77,payload});
+            assert_eq!(m.players[&3].hp,100.);
+            assert_eq!(m.players[&4].hp,100.,"cover must be tested before creating the hole");
+            assert_eq!(m.players[&6].hp,100.);
+            assert!(m.players[&2].hp < 100.);
+            if payload == Burst::Tank {
+                assert!(!m.players[&2].alive);
+                assert!(m.events.iter().any(|e|e["type"]=="kill" && e["weapon"]=="tank" && e["vehicleKind"]=="mbt"));
+            }
+        }
+    }
+    #[test]
+    fn apc_primary_is_explosive_secondary_remains_mg_and_both_share_service() {
+        let mut m=vehicle_lane("apc",json!([]));
+        m.input(1,&json!({"shoot":true,"apcRounds":true,"pitch":-0.08}));
+        m.step(0.05);
+        let snapshot=m.snapshot(); let car=&snapshot["vehicles"][0];
+        assert_eq!(car["shells"],7);assert_eq!(car["mgAmmo"],100);
+        assert_eq!(snapshot["shells"].as_array().unwrap().len(),1);
+        assert!(m.events.iter().any(|e|e["type"]=="tankFire" && e["weapon"]=="apc_he"));
+        m.input(1,&json!({"secondary":true,"apcRounds":true}));m.step(0.05);
+        let snapshot=m.snapshot();assert_eq!(snapshot["vehicles"][0]["mgAmmo"],99);
+        assert_eq!(snapshot["vehicles"][0]["shells"],7);
+    }
+    #[test]
+    fn settled_fragments_have_the_same_footprint_for_late_joiners_and_clear_next_round() {
+        let mut m=skirmish(json!([{"kind":"wall","x":0.,"z":1.,"w":7.,"h":3.,"d":0.75,"solid":true,"hp":390.}]));
+        let p=m.players[&1].clone();
+        m.damage_prop(0,[2.,1.,1.4],Damage::Tank,155.,&p);
+        let rows=m.snapshot()["propChanges"][0]["rubble"].clone();
+        let pieces=&m.props[0].rubble; assert!(!pieces.is_empty() && pieces.len()<=crate::rubble::LIMIT);
+        for rock in pieces {
+            let [x,z]=crate::rubble::center(rock);assert!(m.props[0].loose_footing(x,z));
+        }
+        let [x,z]=crate::rubble::center(&pieces[0]);
+        let q=m.players.get_mut(&1).unwrap(); q.x=x;q.z=z;
+        m.input(1,&json!({"forward":1.}));m.step(0.05);assert!(m.players[&1].loose_footing);
+        m.add_player(6,"Late");assert_eq!(m.snapshot()["propChanges"][0]["rubble"],rows);
+        m.reset();assert!(m.props[0].rubble.is_empty());
+    }
+    #[test]
     fn shell_position_drops_during_flight_and_small_arms_leave_geometry_intact() {
         let mut m = vehicle_lane(
             "mbt",
@@ -2887,7 +2897,7 @@ mod tests {
                 assert_eq!(v["mgAmmo"], 0);
                 assert_eq!(v["hp"], 95.);
             }
-            assert_eq!(v["shells"], 0);
+            assert_eq!(v["shells"], if v["kind"] == "apc" {8} else {0});
         }
         assert!(speeds[0] > speeds[1] * 1.8);
     }
@@ -3034,6 +3044,65 @@ mod tests {
         assert!(m.players[&2].shield > 0.);
     }
     #[test]
+    fn wall_ghosts_join_flush_and_build_the_confirmed_pose_once() {
+        let mut m = skirmish(json!([]));
+        let p = m.players.get_mut(&1).unwrap();
+        p.wood=24; p.metal=8;
+        let build = |m: &mut Match, x:f32,z:f32,yaw:f32, expected:Option<&str>| {
+            let p=m.players.get_mut(&1).unwrap();
+            p.x=x; p.z=z;
+            act(m,json!({"build":true,"yaw":yaw,"pitch":0.}));
+            let ghost=m.players[&1].preview.clone().unwrap();
+            assert_eq!(ghost["valid"],true,"{ghost}");
+            assert_eq!(ghost["snapKind"].as_str(),expected,"{ghost}");
+            // A player can still be moving when the displayed frame is confirmed.
+            m.players.get_mut(&1).unwrap().x+=0.14;
+            act(m,json!({"place":true,"previewId":ghost["previewId"],"supportBuildId":null}));
+            let placed=m.props.last().unwrap();
+            assert_eq!(ghost["x"],json!(placed.x));
+            assert_eq!(ghost["z"],json!(placed.z));
+            assert_eq!(ghost["yaw"],json!(placed.yaw));
+        };
+        build(&mut m,0.,8.,0.,None);
+        build(&mut m,3.1,8.,0.,Some("straight"));
+        build(&mut m,6.85,3.65,-PI*0.5,Some("corner"));
+        build(&mut m,0.,2.40,PI,Some("side"));
+        assert_eq!(m.props.len(),4);
+        assert!((m.props[1].x-m.props[0].x-3.1).abs()<0.001);
+        assert!(m.props[0].touches(&m.props[1]) && !m.props[0].overlaps_margin(&m.props[1],-0.0001));
+        assert!(m.props[1].touches(&m.props[2]) && !m.props[1].overlaps_margin(&m.props[2],-0.0001));
+        assert!((m.props[1].yaw-m.props[2].yaw).cos().abs()<0.0001);
+        assert_eq!((m.players[&1].wood,m.players[&1].metal),(12,4));
+    }
+    #[test]
+    fn wall_confirmation_rechecks_anchor_visibility_range_and_occupancy() {
+        let mut m=skirmish(json!([]));
+        let p=m.players.get_mut(&1).unwrap();p.wood=12;p.metal=4;
+        act(&mut m,json!({"build":true}));act(&mut m,json!({"place":true}));
+        m.players.get_mut(&1).unwrap().x=3.1;
+        act(&mut m,json!({"build":true,"yaw":0.}));
+        let ghost=m.players[&1].preview.clone().unwrap();
+        assert_eq!(ghost["snapKind"],"straight");
+        let click=json!({"place":true,"previewId":ghost["previewId"]});
+        m.players.get_mut(&2).unwrap().x=3.1;
+        m.players.get_mut(&2).unwrap().z=5.5;
+        act(&mut m,click.clone());
+        assert_eq!(m.props.len(),1);
+        m.players.get_mut(&2).unwrap().z=-8.;
+        m.players.get_mut(&1).unwrap().x=13.;
+        act(&mut m,click.clone());
+        assert_eq!(m.props.len(),1);
+        m.players.get_mut(&1).unwrap().x=3.1;
+        m.props[0].dead=true;
+        act(&mut m,click);
+        assert_eq!(m.props.len(),1);
+        assert_eq!((m.players[&1].wood,m.players[&1].metal),(9,3));
+        // The footprint is free but the ground on the far side of a wall is hidden.
+        let mut blocked=skirmish(json!([{"kind":"fence","x":0,"z":6.7,"w":4,"d":0.12,"h":3.,"solid":true}]));
+        act(&mut blocked,json!({"build":true}));
+        assert_eq!(blocked.players[&1].preview.as_ref().unwrap()["clear"],false);
+    }
+    #[test]
     fn upper_wall_uses_aimed_intact_support_and_preserves_its_slot() {
         let mut m = skirmish(json!([]));
         let builder = m.players.get_mut(&1).unwrap();
@@ -3113,7 +3182,7 @@ mod tests {
         shoot(&mut m, 0., 0.);
         assert_eq!(m.props[1].hp, Some(50.));
         let soldier = m.players[&1].clone();
-        m.launch_shell(&soldier, [0., EYE, 8.], 0., 0., 0);
+        m.launch_shell(&soldier, [0., EYE, 8.], 0., 0., 0, Burst::Tank);
         advance(&mut m, 0.1);
         assert!(m.props[1].dead);
         assert_eq!(m.props[3].kind, "wreck");
@@ -3266,7 +3335,7 @@ mod tests {
         assert_eq!(m.ray(o, d, 4.).0, Some(0));
         assert!(m.blocked(-0.1, 4., 0.36));
         let p = m.players.remove(&1).unwrap();
-        m.launch_shell(&p, o, -PI * 0.5, 0., 0);
+        m.launch_shell(&p, o, -PI * 0.5, 0., 0, Burst::Tank);
         m.players.insert(1, p);
         assert!(m.blocked(-0.1, 4., 0.36));
         advance(&mut m, 0.1);
@@ -3323,6 +3392,95 @@ mod tests {
             .iter()
             .any(|e| e["type"] == "droneDown" && e["droneId"] == 1));
         assert_eq!((m.players[&1].hp, m.players[&2].kills, m.red), (100., 0, 0));
+    }
+    #[test]
+    fn thrown_drone_detaches_rejoins_and_can_be_shot_while_the_operator_walks() {
+        let mut m = skirmish(json!([]));
+        advance(&mut m, 2.5);
+        let link = json!({"drone":true,"droneLink":true});
+        m.input(1,&link); m.step(0.05);
+        let toss=m.snapshot();
+        let id=toss["players"][0]["deployedDroneId"].as_u64().unwrap();
+        assert!(toss["players"][0]["droneId"].is_null());
+        assert!(toss["players"][0]["droneLaunch"].as_f64().unwrap()>0.8);
+        let y=|s:&Value|s["drones"][0]["y"].as_f64().unwrap();
+        assert!((y(&toss)-1.32).abs()<0.01);
+        advance(&mut m,0.55);
+        assert!(y(&m.snapshot())>y(&toss)+0.4 && y(&m.snapshot())<4.0);
+        advance(&mut m,0.45);
+        let air=m.snapshot();
+        assert_eq!(air["players"][0]["droneId"],id);
+        assert!(y(&air)>4.0);
+        m.input(1,&json!({"pulse":true}));m.step(0.05);
+        m.input(1,&link);m.step(0.05);
+        let detached=m.snapshot();
+        assert!(detached["players"][0]["droneId"].is_null());
+        assert_eq!(detached["drones"][0]["piloted"],false);
+        let z=m.players[&1].z;
+        m.input(1,&json!({"forward":1}));advance(&mut m,0.3);
+        assert!((m.players[&1].z-z).abs()>0.5);
+        m.add_player(3,"late");
+        let late=m.snapshot();
+        assert_eq!(late["drones"][0]["z"],detached["drones"][0]["z"]);
+        assert_eq!(late["drones"][0]["id"],id);
+        assert_eq!(late["drones"][0]["charges"],0);
+        m.input(1,&link);m.step(0.05);
+        assert_eq!(m.snapshot()["players"][0]["droneId"],id);
+        m.input(1,&link);m.step(0.05);
+        let d=&late["drones"][0];
+        let dx=d["x"].as_f64().unwrap() as f32-m.players[&2].x;
+        let dz=d["z"].as_f64().unwrap() as f32-m.players[&2].z;
+        let pitch=(y(&late) as f32-EYE).atan2(dx.hypot(dz));
+        m.input(2,&json!({"shoot":true,"yaw":dx.atan2(-dz),"pitch":pitch}));m.step(0.05);
+        let down=m.snapshot();
+        assert!(down["drones"].as_array().unwrap().is_empty());
+        assert!(down["players"][0]["deployedDroneId"].is_null());
+        assert!(down["players"][0]["droneCooldown"].as_f64().unwrap()>44.);
+        assert!(m.events.iter().any(|e| e["type"]=="droneDown" && e["droneId"]==id && e["owner"]==1));
+    }
+
+    #[test]
+    fn drone_airframe_and_camera_clear_on_owner_disconnect_and_round_end() {
+        let mut m=skirmish(json!([]));
+        let launch=json!({"drone":true,"droneLink":true});
+        m.input(1,&launch);m.step(0.05);
+        m.remove_player(1);
+        assert!(m.snapshot()["drones"].as_array().unwrap().is_empty());
+        m.input(2,&launch);m.step(0.05);
+        assert_eq!(m.snapshot()["drones"].as_array().unwrap().len(),1);
+        m.end_round();
+        let s=m.snapshot();
+        assert!(s["drones"].as_array().unwrap().is_empty());
+        assert!(s["players"][0]["droneId"].is_null() && s["players"][0]["deployedDroneId"].is_null());
+    }
+
+    #[test]
+    fn operator_death_removes_hovering_drone_and_respawn_starts_a_new_sortie() {
+        let mut m = skirmish(json!([]));
+        advance(&mut m, 2.5);
+        let link = json!({"drone":true,"droneLink":true});
+        m.input(1, &link);
+        advance(&mut m, 1.0);
+        let first = m.snapshot()["drones"][0]["id"].as_u64().unwrap();
+        m.input(1, &link);
+        m.step(0.05);
+        assert_eq!(m.snapshot()["drones"][0]["piloted"], false);
+
+        let mut red = m.players.remove(&2).unwrap();
+        m.harm(&mut red, 1, 200., "mr7", false, None);
+        m.players.insert(2, red);
+        let dead = m.snapshot();
+        assert_eq!(dead["players"][0]["alive"], false);
+        assert!(dead["drones"].as_array().unwrap().is_empty());
+        assert!(dead["players"][0]["deployedDroneId"].is_null());
+        assert!(dead["players"][0]["droneId"].is_null());
+
+        advance(&mut m, 4.2);
+        m.input(1, &link);
+        advance(&mut m, 1.0);
+        let fresh = m.snapshot();
+        assert!(fresh["players"][0]["droneId"].as_u64().unwrap() > first);
+        assert_eq!(fresh["drones"][0]["charges"], 1);
     }
     fn campaign_build(team: &str, kind: &str, x: f32, z: f32) -> Prop {
         Prop {
@@ -3470,10 +3628,10 @@ mod tests {
                 .any(|e| e["type"] == "shot" && e["impactMaterial"] == "metal"));
             m.damage_prop(0, [0., 1., 5.], Damage::Grenade, 80., &p);
             assert_eq!(m.props[0].hp, Some(180.));
-            m.launch_shell(&p, [0., EYE, 8.], 0., 0., 0);
+            m.launch_shell(&p, [0., EYE, 8.], 0., 0., 0, Burst::Tank);
             advance(&mut m, 0.1);
             assert_eq!(m.props[0].hp, Some(25.));
-            m.launch_shell(&p, [0., EYE, 8.], 0., 0., 0);
+            m.launch_shell(&p, [0., EYE, 8.], 0., 0., 0, Burst::Tank);
             advance(&mut m, 0.1);
             assert!(m.props[0].dead);
         }
@@ -3488,7 +3646,7 @@ mod tests {
             m.infantry_ray(&mut p, [0., EYE, 8.], 0., 0.);
         }
         assert_eq!(m.snapshot()["vehicles"][0]["hp"].as_f64().unwrap(), health);
-        m.launch_shell(&p, [0., EYE, 8.], 0., 0., 0);
+        m.launch_shell(&p, [0., EYE, 8.], 0., 0., 0, Burst::Tank);
         advance(&mut m, 0.1);
         assert_eq!(
             m.snapshot()["vehicles"][0]["hp"].as_f64().unwrap(),
@@ -3602,7 +3760,7 @@ mod tests {
         shoot(&mut m, 0., 0.);
         assert!(!m.props[0].dead);
         let soldier = m.players[&1].clone();
-        m.launch_shell(&soldier, [0., EYE, 8.], 0., 0., 0);
+        m.launch_shell(&soldier, [0., EYE, 8.], 0., 0., 0, Burst::Tank);
         advance(&mut m, 0.1);
         assert!(m.props[0].dead);
         assert!(m.events.iter().any(|e| e["type"] == "shot"

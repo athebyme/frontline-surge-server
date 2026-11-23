@@ -118,7 +118,7 @@ fn debug_service_selects_only_live_friendly_vehicles_and_prefers_the_driver_seat
         (apc.hp, apc.fuel, apc.mg_ammo),
         (apc.max_hp, apc.max_fuel, apc.mg_capacity)
     );
-    assert_eq!(apc.shells, 0);
+    assert_eq!(apc.shells, apc.shell_capacity);
     assert_eq!(l.vehicles[0].hp, 1.);
     assert_eq!(l.vehicles[1].hp, 1.);
     assert_eq!(l.vehicles[3].hp, 1.);
@@ -131,7 +131,7 @@ fn debug_service_selects_only_live_friendly_vehicles_and_prefers_the_driver_seat
     let tank = &l.vehicles[3];
     assert_eq!(
         (tank.hp, tank.fuel, tank.mg_ammo, tank.shells),
-        (tank.max_hp, tank.max_fuel, tank.mg_capacity, MAX_TANK_SHELLS)
+        (tank.max_hp, tank.max_fuel, tank.mg_capacity, MAX_SHELLS)
     );
     assert_eq!(l.vehicles[2].hp, 7.);
     l.vehicles[3].driver = None;

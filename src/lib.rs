@@ -1,5 +1,7 @@
 pub mod arsenal;
 pub mod fracture;
+pub mod rubble;
+pub mod vehicle_gun;
 mod wire;
 mod world_wire;
 pub use wire::PROTOCOL;

@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::f32::consts::{PI, TAU};
 
-const MAX_TANK_SHELLS: u32 = 12;
+const MAX_SHELLS: u32 = 12;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct VehicleSpawn {
@@ -98,6 +98,7 @@ struct Vehicle {
     z: f32,
     yaw: f32,
     turret_yaw: f32,
+    turret_unwrapped: f32,
     speed: f32,
     #[serde(skip)]
     course: f32,
@@ -117,6 +118,7 @@ struct Vehicle {
     upgrade: Option<String>,
     upgrade_level: u32,
     shells: u32,
+    shell_capacity: u32,
     mg_ammo: u32,
     mg_capacity: u32,
     travel: f32,
@@ -143,6 +145,7 @@ impl Vehicle {
             z: spawn.z,
             yaw: spawn.yaw,
             turret_yaw: spawn.yaw,
+            turret_unwrapped: spawn.yaw,
             speed: 0.,
             course: spawn.yaw,
             last_driver: None,
@@ -172,7 +175,8 @@ impl Vehicle {
             impact_delay: 0.,
             travel: 0.,
             steering: 0.,
-            shells: if spawn.kind == "mbt" { 8 } else { 0 },
+            shells: if matches!(spawn.kind.as_str(),"mbt"|"apc") { 8 } else { 0 },
+            shell_capacity: if matches!(spawn.kind.as_str(),"mbt"|"apc") { MAX_SHELLS } else { 0 },
             spawn: spawn.clone(),
             cooldown: 0.,
             salvage: 0,
@@ -232,11 +236,11 @@ impl Logistics {
             "apc" => "apc",
             _ => return None,
         };
-        let (sp, cp) = pitch.clamp(-0.7, 0.7).sin_cos();
-        let (sy, cy) = v.turret_yaw.sin_cos();
+        let mount = crate::vehicle_gun::Mount::for_kind(vehicle_kind)?;
+        let ray = mount.ray(v.x, v.z, v.yaw, v.turret_yaw, pitch, true);
         Some(MachinegunRay {
-            origin: [v.x, 2.08, v.z],
-            direction: [sy * cp, sp, -cy * cp],
+            origin: ray.origin,
+            direction: ray.direction,
             vehicle_kind,
         })
     }
@@ -483,7 +487,7 @@ impl Logistics {
             if v.kind == "mbt" {
                 hint.push_str(" · [ЛКМ] Пушка · [ПКМ] Пулемёт");
             } else if v.kind == "apc" {
-                hint.push_str(" · [ЛКМ] Пулемёт");
+                hint.push_str(" · [ЛКМ] Осколочный · [ПКМ] Пулемёт");
             }
             if v.cargo_capacity > 0 {
                 hint.push_str("  ·  [T] Груз");
@@ -742,12 +746,15 @@ impl Logistics {
         );
         let v = &mut self.vehicles[i];
         let (x, z, yaw, speed) = (v.x, v.z, v.yaw, v.speed);
-        let turret_step = 1.28 * dt;
-        v.turret_yaw = if matches!(v.kind.as_str(), "mbt" | "apc") {
-            wrap(v.turret_yaw + wrap(p.yaw - v.turret_yaw).clamp(-turret_step, turret_step))
+        let turret_step = crate::vehicle_gun::TURN_RATE * dt;
+        if matches!(v.kind.as_str(), "mbt" | "apc") {
+            let target = p.turret_aim.unwrap_or_else(|| v.turret_unwrapped + wrap(p.yaw - v.turret_yaw));
+            v.turret_unwrapped += (target - v.turret_unwrapped).clamp(-turret_step, turret_step);
+            v.turret_yaw = wrap(v.turret_unwrapped);
         } else {
-            yaw
-        };
+            v.turret_unwrapped = yaw;
+            v.turret_yaw = yaw;
+        }
         p.x = x;
         p.z = z;
         p.moving = speed.abs() > 0.3;
@@ -755,14 +762,18 @@ impl Logistics {
         p.build_mode = false;
         p.preview = None;
         p.recoil = 0.;
-        if v.kind == "mbt" && pressed(input, "shoot") && v.cooldown <= 0. && v.shells > 0 {
+        // Older clients operate the APC's original single-trigger MG.
+        let apc_rounds = v.kind == "apc" && pressed(input, "apcRounds");
+        if (v.kind == "mbt" || apc_rounds) && pressed(input, "shoot") && v.cooldown <= 0. && v.shells > 0 {
+            let mount = crate::vehicle_gun::Mount::for_kind(&v.kind).expect("armed vehicle mount");
+            let ray = mount.ray(x,z,yaw,v.turret_yaw,p.pitch,false);
             v.shells -= 1;
-            v.cooldown = 3.6;
+            v.cooldown = if apc_rounds { 1.65 } else { 3.6 };
             p.shield = 0.;
-            events.push(json!({"type":"tankFire","actor":p.id,"x":x,"z":z,"y":2.25,"yaw":v.turret_yaw,"pitch":p.pitch.clamp(-0.6,0.6),"vehicleId":v.id}));
+            events.push(json!({"type":"tankFire","actor":p.id,"x":ray.origin[0],"y":ray.origin[1],"z":ray.origin[2],"yaw":v.turret_yaw,"pitch":ray.pitch,"vehicleId":v.id,"weapon":if apc_rounds {"apc_he"} else {"tank"},"reloadTime":v.cooldown}));
         }
         if v.mg_capacity > 0
-            && (pressed(input, "secondary") || (v.kind == "apc" && pressed(input, "shoot")))
+            && (pressed(input, "secondary") || (v.kind == "apc" && !apc_rounds && pressed(input, "shoot")))
             && v.mg_delay <= 0.0
             && v.mg_ammo > 0
         {
@@ -845,9 +856,7 @@ impl Logistics {
         v.hp = v.max_hp;
         v.fuel = v.max_fuel;
         v.mg_ammo = v.mg_capacity;
-        if v.kind == "mbt" {
-            v.shells = MAX_TANK_SHELLS;
-        }
+        v.shells = v.shell_capacity;
         p.notice("Машина отремонтирована, топливо и боезапас пополнены");
     }
     fn upgrade(&mut self, p: &mut Player, scene: &[Prop], i: usize) {
@@ -982,14 +991,12 @@ impl Logistics {
             return;
         }
         if let Some(v) = vehicle.filter(|v| v.mg_capacity > 0 && !v.destroyed) {
-            let shells_full = v.kind != "mbt" || v.shells >= MAX_TANK_SHELLS;
+            let shells_full = v.shells >= v.shell_capacity;
             if shells_full && v.mg_ammo >= v.mg_capacity {
                 p.notice("Боекомплект полный");
                 return;
             }
-            if v.kind == "mbt" {
-                v.shells = (v.shells + 3).min(MAX_TANK_SHELLS);
-            }
+            v.shells = (v.shells + 3).min(v.shell_capacity);
             v.mg_ammo = (v.mg_ammo + 28).min(v.mg_capacity);
             p.notice("Боекомплект машины пополнен");
         } else {
@@ -1043,6 +1050,8 @@ impl Logistics {
                 } else if let Some(i) = self.vehicle_near(p) {
                     let v = &mut self.vehicles[i];
                     if !v.destroyed && v.driver.is_none() && v.team == p.team {
+                        v.turret_unwrapped = v.turret_yaw;
+                        p.turret_aim = None;
                         v.driver = Some(p.id);
                         v.last_driver = Some(p.id);
                         p.x = v.x;

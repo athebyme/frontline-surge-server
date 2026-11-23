@@ -332,6 +332,14 @@ impl Layout {
             .map(|(i, _)| i as u16)
             .collect()
     }
+    pub fn surface_material(&self, state: &FractureState, point: [f32; 3]) -> Option<Material> {
+        self.cells
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !state.broken.contains(&(*i as u16)))
+            .min_by(|a, b| a.1.distance2(point).total_cmp(&b.1.distance2(point)))
+            .map(|(_, cell)| cell.material)
+    }
     fn surface_impact(&self, state: &mut FractureState, point: [f32; 3]) -> Change {
         let Some((index, cell)) = self
             .cells
