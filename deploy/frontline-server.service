@@ -1,0 +1,18 @@
+[Unit]
+Description=Frontline Surge dedicated server
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/frontline-surge
+ExecStart=/opt/frontline-surge/current/frontline-server --bind 0.0.0.0 --port 8787 --bots 4 --round-minutes 120
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

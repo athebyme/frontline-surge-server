@@ -1,0 +1,21 @@
+name: Server CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  server-test-build:
+    name: server-test-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: cargo test --locked --all-features
+      - name: Build
+        run: cargo build --release --locked --all-features
