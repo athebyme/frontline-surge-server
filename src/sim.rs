@@ -203,7 +203,7 @@ pub(crate) struct Prop {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) team: Option<String>,
     pub(crate) built: bool,
-    #[serde(skip_serializing_if = "is_ground_level_default")]
+    #[serde(skip_serializing_if = "level_unspecified")]
     pub(crate) level: u8,
     #[serde(skip)]
     pub(crate) capacity: u32,
@@ -263,7 +263,7 @@ fn object_damage(kind: &str, style: Option<&str>, source: Damage, incoming: f32)
     };
     incoming * scale
 }
-fn is_ground_level_default(level: &u8) -> bool {
+fn level_unspecified(level: &u8) -> bool {
     *level == 0
 }
 
@@ -2267,19 +2267,23 @@ impl Match {
         let (sp, cp) = p.pitch.sin_cos();
         let direction = [sy * cp, sp, -cy * cp];
         let reach = 5.;
-        let support = self.props[self.level.props.len()..]
+        let wall_in_reach = self.props[self.level.props.len()..]
             .iter()
             .any(|q| q.kind == "barricade" && !q.dead && q.footprint(p.x, p.z) <= reach * reach);
-        if !support {
+        if !wall_in_reach {
             return None;
         }
         let (hit, distance) = self.ray(eye, direction, reach);
         let i = hit?;
         let q = &self.props[i];
-        (q.built && q.kind == "barricade" && q.team.as_deref() == Some(&p.team)
-            && q.level == 1 && q.hp == q.max_hp && q.fracture.broken.is_empty()
+        (q.built
+            && q.kind == "barricade"
+            && q.team.as_deref() == Some(p.team.as_str())
+            && q.level == 1
+            && q.hp == q.max_hp
+            && q.fracture.broken.is_empty()
             && self.logistics.ray(eye, direction, distance, None).is_none())
-            .then_some(i)
+        .then_some(i)
     }
     fn preview(&self, p: &Player) -> (Prop, Option<usize>, bool) {
         let (sn, cs) = p.yaw.sin_cos();
@@ -2305,7 +2309,11 @@ impl Match {
             max_hp: Some(hp),
             ..Default::default()
         };
-        let support = if kind == "wall" { self.wall_support(p) } else { None };
+        let support = if kind == "wall" {
+            self.wall_support(p)
+        } else {
+            None
+        };
         build.level = 1;
         if let Some(i) = support {
             let base = &self.props[i];
@@ -2954,35 +2962,37 @@ mod tests {
         m.props[0].fracture.broken.clear();
 
         act(&mut m, json!({"place":true,"supportBuildId":first_id+1}));
-        assert_eq!((m.players[&1].wood, m.players[&1].metal), (9,3));
+        assert_eq!((m.players[&1].wood, m.players[&1].metal), (9, 3));
         assert_eq!(m.props[0].build_id, Some(first_id));
         act(&mut m, json!({"place":true,"supportBuildId":first_id}));
-        assert_eq!((m.players[&1].wood, m.players[&1].metal), (6,2));
+        assert_eq!((m.players[&1].wood, m.players[&1].metal), (6, 2));
         assert_eq!(m.props.len(), 1);
         let wall = &m.snapshot()["builtProps"][0];
         assert_eq!(wall["level"], 2);
-        assert_eq!(wall["h"], json!(height*2.));
+        assert_eq!(wall["h"], json!(height * 2.));
         assert_eq!(wall["hp"], 280.);
         assert_ne!(wall["buildId"], first_id);
-        assert!(m.props[0].ray([x, 2., z+2.], [0.,0.,-1.], 4.).is_some());
+        assert!(m.props[0].ray([x, 2., z + 2.], [0., 0., -1.], 4.).is_some());
 
         act(&mut m, json!({"build":true}));
         act(&mut m, json!({"place":true}));
         assert_eq!(m.players[&1].preview.as_ref().unwrap()["valid"], false);
-        assert_eq!((m.players[&1].wood, m.players[&1].metal), (6,2));
+        assert_eq!((m.players[&1].wood, m.players[&1].metal), (6, 2));
         // Damage reaches the bottom courses; their disappearance takes unsupported cells with them.
         for _ in 0..20 {
-            m.damage_prop(0, [x,-0.85,z], Damage::Ram(90.), 45., &player);
-            if m.props[0].dead { break; }
+            m.damage_prop(0, [x, -0.85, z], Damage::Ram(90.), 45., &player);
+            if m.props[0].dead {
+                break;
+            }
         }
         assert!(m.props[0].dead);
-        assert!(m.events.iter().any(|e| e["type"]=="fracture" && e["collapsed"]==true));
+        assert!(m.events.iter().any(|e| e["type"] == "fracture" && e["collapsed"] == true));
         assert_eq!(m.snapshot()["builtProps"][0]["dead"], true);
-        assert!(m.props[0].ray([x, 2., z+2.], [0.,0.,-1.], 4.).is_none());
+        assert!(m.props[0].ray([x, 2., z + 2.], [0., 0., -1.], 4.).is_none());
         // A delayed placement aimed at the vanished support cannot become a fresh ground wall.
         act(&mut m, json!({"place":true,"supportBuildId":first_id}));
         assert!(m.props[0].dead);
-        assert_eq!((m.players[&1].wood, m.players[&1].metal), (6,2));
+        assert_eq!((m.players[&1].wood, m.players[&1].metal), (6, 2));
     }
 
     #[test]
