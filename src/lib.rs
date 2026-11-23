@@ -1,4 +1,5 @@
 pub mod arsenal;
+pub mod buggy;
 pub mod fracture;
 pub mod rubble;
 pub mod vehicle_gun;

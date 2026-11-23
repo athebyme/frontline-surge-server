@@ -58,7 +58,7 @@ pub enum Damage {
     Grenade,
     Tank,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Cell {
     pub center: [f32; 3],
     pub size: [f32; 3],
@@ -76,6 +76,7 @@ struct Scar {
 #[derive(Clone, Debug, Default)]
 pub struct FractureState {
     pub broken: BTreeSet<u16>,
+    cuts: BTreeMap<u16, u8>,
     pub revision: u32,
     pub scar_revision: u32,
     scars: VecDeque<Scar>,
@@ -83,6 +84,41 @@ pub struct FractureState {
     wear: BTreeMap<u16, f32>,
 }
 impl FractureState {
+    pub fn missing_material(&self) -> bool {
+        !self.broken.is_empty() || !self.cuts.is_empty()
+    }
+    pub fn repair(&mut self, limit: usize) {
+        let repaired: Vec<_> = self.broken.iter().chain(self.cuts.keys()).copied().take(limit).collect();
+        for id in repaired {
+            self.broken.remove(&id);
+            self.cuts.remove(&id);
+        }
+        self.wear.retain(|id, _| self.cuts.contains_key(id));
+        self.scars.clear();
+        self.scar_revision = self.scar_revision.wrapping_add(1);
+        self.revision = self.revision.wrapping_add(1);
+    }
+    /// Four low bits encode an exposed face and its two possible cut depths.
+    pub fn packed_cuts(&self) -> impl Iterator<Item = u32> + '_ {
+        self.cuts.iter().map(|(&id, &cut)| (u32::from(id) << 4) | u32::from(cut))
+    }
+    pub fn replace_cuts(&mut self, codes: impl Iterator<Item = u32>) {
+        self.cuts.clear();
+        self.cuts.extend(codes.filter_map(|n| {
+            let cut = (n & 15) as u8;
+            (cut < 12).then_some((u16::try_from(n >> 4).ok()?, cut))
+        }));
+    }
+    pub fn clipped(&self, index: u16, mut cell: Cell) -> Cell {
+        if let Some(&cut) = self.cuts.get(&index) {
+            let axis = usize::from(cut / 4);
+            let sign = if cut & 2 == 0 { 1. } else { -1. };
+            let depth = cell.size[axis] * if cut & 1 == 0 { 0.28 } else { 0.56 };
+            cell.center[axis] -= sign * depth * 0.5;
+            cell.size[axis] -= depth;
+        }
+        cell
+    }
     // Bits 0..1 = stage, bits 2..7 = affected faces, high bits = cell.
     pub fn packed_scars(&self) -> Vec<u32> {
         self.scars
@@ -113,6 +149,7 @@ fn masonry(mat: Material) -> bool {
 pub struct Change {
     pub removed: Vec<u16>,
     pub collapsed: Vec<u16>,
+    pub chipped: Vec<u32>,
     pub touched: bool,
 }
 #[derive(Clone, Debug)]
@@ -133,27 +170,31 @@ impl Cell {
             .sum()
     }
     fn ray(&self, o: [f32; 3], d: [f32; 3], limit: f32) -> Option<f32> {
-        let (mut lo, mut hi) = (0.0_f32, limit);
-        for i in 0..3 {
-            let c = self.center[i] - o[i];
-            let half = self.size[i] * 0.5;
-            if d[i].abs() < 0.000001 {
-                // Adjacent cell edges can differ by a few ulps at a panel seam.
-                if c.abs() > half + 1e-5 {
-                    return None;
-                }
-            } else {
-                let a = (c - half) / d[i];
-                let b = (c + half) / d[i];
-                lo = lo.max(a.min(b));
-                hi = hi.min(a.max(b));
-                if lo > hi {
-                    return None;
-                }
+        box_ray(self.center, self.size, o, d, limit)
+    }
+}
+
+pub(crate) fn box_ray(center: [f32; 3], size: [f32; 3], o: [f32; 3], d: [f32; 3], limit: f32) -> Option<f32> {
+    let (mut lo, mut hi) = (0.0_f32, limit);
+    for i in 0..3 {
+        let c = center[i] - o[i];
+        let half = size[i] * 0.5;
+        if d[i].abs() < 0.000001 {
+            // Adjacent cell edges can differ by a few ulps at a panel seam.
+            if c.abs() > half + 1e-5 {
+                return None;
+            }
+        } else {
+            let a = (c - half) / d[i];
+            let b = (c + half) / d[i];
+            lo = lo.max(a.min(b));
+            hi = hi.min(a.max(b));
+            if lo > hi {
+                return None;
             }
         }
-        Some(lo)
     }
+    Some(lo)
 }
 impl Layout {
     pub fn new(kind: &str, w: f32, h: f32, d: f32, variant: u32) -> Option<Self> {
@@ -283,17 +324,21 @@ impl Layout {
         let mut hit = None;
         let mut best = limit;
         for (i, c) in self.cells.iter().enumerate() {
-            if let Some(t) = c.ray(o, d, best) {
-                if !state.broken.contains(&(i as u16)) {
-                    best = t;
-                    hit = Some(t);
-                }
+            let Some(mut t) = c.ray(o, d, best) else { continue };
+            let id = i as u16;
+            if state.broken.contains(&id) { continue; }
+            if state.cuts.contains_key(&id) {
+                let Some(face) = state.clipped(id, *c).ray(o, d, best) else { continue };
+                t = face;
             }
+            best = t;
+            hit = Some(t);
         }
         hit
     }
     pub fn intersects(&self, state: &FractureState, x: f32, z: f32, r: f32) -> bool {
         self.cells.iter().enumerate().any(|(i, c)| {
+            let c = state.clipped(i as u16, *c);
             if c.center[1] - c.size[1] * 0.5 >= 1.82 {
                 return false;
             }
@@ -337,6 +382,7 @@ impl Layout {
             .iter()
             .enumerate()
             .filter(|(i, _)| !state.broken.contains(&(*i as u16)))
+            .map(|(i,c)| (i, state.clipped(i as u16,*c)))
             .min_by(|a, b| a.1.distance2(point).total_cmp(&b.1.distance2(point)))
             .map(|(_, cell)| cell.material)
     }
@@ -346,6 +392,7 @@ impl Layout {
             .iter()
             .enumerate()
             .filter(|(i, _)| !state.broken.contains(&(*i as u16)))
+            .map(|(i,c)| (i, state.clipped(i as u16,*c)))
             .min_by(|a, b| a.1.distance2(point).total_cmp(&b.1.distance2(point)))
         else {
             return Change::default();
@@ -393,6 +440,31 @@ impl Layout {
             ..Default::default()
         }
     }
+    /// Pick an exposed face toward the impact. A surviving block keeps contact
+    /// with its supports; material can only be chipped away from an open side.
+    fn cut_face(&self, state: &FractureState, id: u16, impact: [f32; 3]) -> Option<u8> {
+        let cell = &self.cells[usize::from(id)];
+        let mut covered = [false; 6];
+        for &(neighbor, _) in &self.neighbors[usize::from(id)] {
+            if state.broken.contains(&neighbor) { continue; }
+            let other = &self.cells[usize::from(neighbor)];
+            for axis in 0..3 {
+                let delta = other.center[axis] - cell.center[axis];
+                if delta.abs() > 0.001 {
+                    covered[axis * 2 + usize::from(delta < 0.)] = true;
+                    break;
+                }
+            }
+        }
+        // The ground supports the bottom face even without an adjacent wall cell.
+        covered[3] |= cell.center[1] - cell.size[1] * 0.5 < 0.001;
+        (0..6).filter(|&face| !covered[face]).filter_map(|face| {
+            let axis = face / 2;
+            let direction = if face % 2 == 0 { 1. } else { -1. };
+            let score = direction * (impact[axis] - cell.center[axis]) / cell.size[axis];
+            (score > 0.001).then_some((face as u8, score))
+        }).max_by(|a,b| a.1.total_cmp(&b.1)).map(|v| v.0)
+    }
     pub fn damage(&self, state: &mut FractureState, p: [f32; 3], source: Damage) -> Change {
         let mut out = Change::default();
         let radius: f32 = match source {
@@ -406,7 +478,7 @@ impl Layout {
             .iter()
             .enumerate()
             .filter(|(i, _)| !state.broken.contains(&(*i as u16)))
-            .map(|(i, c)| (i as u16, c.distance2(p)))
+            .map(|(i, c)| (i as u16, state.clipped(i as u16,*c).distance2(p)))
             .filter(|(_, d)| *d <= radius * radius);
         let hits: Vec<_> = candidates.collect();
         let mut scarred = false;
@@ -419,13 +491,26 @@ impl Layout {
             out.touched = true;
             let value = state.wear.entry(id).or_default();
             *value += amount;
-            if *value >= mat.strength() {
+            let wear = *value / mat.strength();
+            if wear >= 1. {
                 state.wear.remove(&id);
+                state.cuts.remove(&id);
                 state.broken.insert(id);
                 out.removed.push(id);
-            } else if masonry(mat) && *value > mat.strength() * 0.14 {
-                let stage = (1. + 3. * *value / mat.strength()).min(3.) as u8;
-                scarred |= state.scar(id, 63, stage);
+            } else {
+                if masonry(mat) && wear > 0.14 {
+                    scarred |= state.scar(id, 63, (1. + 3. * wear).min(3.) as u8);
+                }
+                if wear >= 0.38 && mat != Material::Metal {
+                    let previous = state.cuts.get(&id).copied();
+                    if let Some(face) = previous.map(|c| c / 2).or_else(|| self.cut_face(state,id,p)) {
+                        let cut = face * 2 + u8::from(wear >= 0.72);
+                        if previous != Some(cut) {
+                            state.cuts.insert(id,cut);
+                            out.chipped.push((u32::from(id) << 4) | u32::from(cut));
+                        }
+                    }
+                }
             }
         }
         if !out.removed.is_empty() {
@@ -433,11 +518,15 @@ impl Layout {
             for &id in &out.collapsed {
                 state.broken.insert(id);
                 state.wear.remove(&id);
+                state.cuts.remove(&id);
             }
             let before = state.scars.len();
             state.scars.retain(|s| !state.broken.contains(&s.id));
             scarred |= before != state.scars.len();
             out.removed.extend_from_slice(&out.collapsed);
+            out.chipped.retain(|code| !state.broken.contains(&((code >> 4) as u16)));
+        }
+        if !out.chipped.is_empty() || !out.removed.is_empty() {
             state.revision = state.revision.wrapping_add(1);
         }
         if scarred {
@@ -449,6 +538,28 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gouge_has_depth_and_a_back_face_for_movement_shots_and_late_join() {
+        let l = Layout::new("wall", 6., 1.6, 1., 0).unwrap();
+        let mut s = FractureState::default();
+        let ray = |s: &FractureState| l.ray(s, [0.3,0.8,2.], [0.,0.,-1.], 3.);
+        assert_eq!(ray(&s), Some(1.5));
+        let hit = l.damage(&mut s,[0.3,0.8,0.5], Damage::Grenade);
+        assert!(!hit.chipped.is_empty() && hit.removed.is_empty());
+        assert!((ray(&s).unwrap() - 1.78).abs() < 0.001);
+        assert!(!l.intersects(&s,0.3,0.49,0.02));
+        assert!(l.intersects(&s,0.3,0.,0.02));
+        let mut late = FractureState::default();
+        late.replace_cuts(s.packed_cuts());
+        assert_eq!(ray(&s), ray(&late));
+        let version = s.revision;
+        l.damage(&mut s,[0.3,0.8,0.22], Damage::Bullet(25.));
+        assert_eq!(s.revision,version);
+        l.damage(&mut s,[0.3,0.8,0.22], Damage::Tank);
+        assert_eq!(ray(&s),None);
+        assert!(!l.intersects(&s,0.3,0.,0.02));
+        assert!(s.packed_cuts().all(|n| !s.broken.contains(&((n >> 4) as u16))));
+    }
     #[test]
     fn masonry_impacts_spread_on_one_face_without_removing_solid_cells() {
         let l = Layout::new("wall", 8., 3., 0.8, 0).unwrap();

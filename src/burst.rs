@@ -90,12 +90,17 @@ impl Match {
             if !q.alive
                 || q.team == p.team
                 || Some(Contact::Player(id)) == direct
-                || self.logistics.driver_vehicle(id).is_some()
             {
                 continue;
             }
-            let target = [q.x, 0.95, q.z];
-            let dist = (q.x - o[0]).hypot(q.z - o[2]).hypot(target[1] - o[1]);
+            let target = match self.logistics.driver_vehicle(id) {
+                None => [q.x, 0.95, q.z],
+                Some(v) => match self.logistics.exposed_driver_target(v) {
+                    Some(eye) => eye,
+                    None => continue,
+                },
+            };
+            let dist = (target[0] - o[0]).hypot(target[2] - o[2]).hypot(target[1] - o[1]);
             if dist < spec.radius && self.blast_clear(o, target, None, None) {
                 victims.push((id, spec.damage_at(dist)));
             }
@@ -128,7 +133,8 @@ impl Match {
                     .iter()
                     .enumerate()
                     .filter(|(n, _)| !obj.fracture.broken.contains(&(*n as u16)))
-                    .map(|(_, c)| clamp_box(c.center, c.size))
+                    .map(|(id,c)| obj.fracture.clipped(id as u16, *c))
+                    .map(|c| clamp_box(c.center, c.size))
                     .min_by(|a, b| dist(*a).total_cmp(&dist(*b)))
             } else {
                 Some(clamp_box(

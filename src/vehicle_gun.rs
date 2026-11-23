@@ -2,6 +2,13 @@
 pub const TURN_RATE: f32 = 1.28;
 pub const MG_RANGE: f32 = 180.;
 
+/// Playtest timings in map units. Keep the original maximum travel distance.
+pub const TANK_RELOAD: f32 = 3.6;
+pub const APC_RELOAD: f32 = 0.52;
+pub const TANK_SHOT_SPEED: f32 = 246.;
+pub const APC_SHOT_SPEED: f32 = 270.;
+pub const MAX_SHOT_TRAVEL: f32 = 386.;
+
 #[derive(Clone, Copy)]
 pub struct Mount {
     pub pivot: [f32; 3],

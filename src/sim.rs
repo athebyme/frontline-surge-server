@@ -408,7 +408,8 @@ impl Prop {
                     c.center[1] - c.size[1] * 0.5 < height
                         && !self.fracture.broken.contains(&(*id as u16))
                 })
-                .map(|(_, c)| clamp_box(c.center, c.size))
+                .map(|(id,c)| self.fracture.clipped(id as u16, *c))
+                .map(|c| clamp_box(c.center, c.size))
                 .filter(|h| (h[0] - q[0]).hypot(h[2] - q[2]) <= r)
                 .min_by(|a, b| {
                     ((a[0] - q[0]).hypot(a[2] - q[2]).hypot(a[1] - q[1]))
@@ -1646,8 +1647,12 @@ impl Match {
             }
         }
         for (&id, q) in &self.players {
-            if id != p.id && q.alive && self.logistics.driver_vehicle(id).is_none() {
-                if let Some(t) = q.ray(o, d, best) {
+            if id != p.id && q.alive {
+                let hit = match self.logistics.driver_vehicle(id) {
+                    Some(index) => self.logistics.driver_ray(index, o, d, best),
+                    None => q.ray(o, d, best),
+                };
+                if let Some(t) = hit {
                     if t < best {
                         best = t;
                         surface = Contact::Player(id);
@@ -1711,6 +1716,7 @@ impl Match {
         if let Strike::Shell { id, vehicle, payload } = kind {
             info["shellId"] = id.into();
             info["vehicleId"] = vehicle.into();
+            info["trailFrom"] = json!(o);
             info["x"] = end[0].into();
             info["y"] = end[1].into();
             info["z"] = end[2].into();
@@ -1723,7 +1729,7 @@ impl Match {
             self.scene_event("shot", info);
         }
         if let Contact::Player(id) = surface {
-            let head = end[1] > 1.53;
+            let head = end[1] > if self.logistics.driver_vehicle(id).is_some() { 1.43 } else { 1.53 };
             self.harm(
                 p,
                 id,
@@ -1868,6 +1874,7 @@ impl Match {
         if let Some(layout) = self.props[i].layout.clone() {
             let local = self.props[i].local(hit);
             let obj = &mut self.props[i];
+            let revision = obj.fracture.revision;
             let delta = layout.damage(&mut obj.fracture, local, damage);
             if !delta.touched {
                 return;
@@ -1884,15 +1891,17 @@ impl Match {
                 });
             }
             obj.dirty = true;
-            if !delta.removed.is_empty() || !delta.collapsed.is_empty() {
+            if revision != obj.fracture.revision {
                 self.nav = None;
+            }
+            if !delta.removed.is_empty() || !delta.chipped.is_empty() {
                 let all: std::collections::BTreeSet<_> = delta
                     .removed
                     .iter()
                     .chain(&delta.collapsed)
                     .copied()
                     .collect();
-                let details = json!({"actor":p.id,"index":i,"buildId":obj.build_id,"kind":obj.kind,"cells":all,"collapsedCells":delta.collapsed,
+                let details = json!({"actor":p.id,"index":i,"buildId":obj.build_id,"kind":obj.kind,"cells":all,"chips":delta.chipped,"collapsedCells":delta.collapsed,
                     "collapsed":!delta.collapsed.is_empty(),"revision":obj.fracture.revision,"x":hit[0],"y":hit[1],"z":hit[2]});
                 self.scene_event("fracture", details);
             }
@@ -1917,6 +1926,7 @@ impl Match {
     fn launch_shell(&mut self, p: &Player, o: [f32; 3], yaw: f32, pitch: f32, vehicle_id: u32, payload: Burst) {
         let (sp, cp) = pitch.sin_cos();
         let (sy, cy) = yaw.sin_cos();
+        let speed = if payload == Burst::Apc { crate::vehicle_gun::APC_SHOT_SPEED } else { crate::vehicle_gun::TANK_SHOT_SPEED };
         let shell = Shell {
             id: self.next_shell,
             actor: p.id,
@@ -1927,10 +1937,10 @@ impl Match {
             x: o[0],
             y: o[1],
             z: o[2],
-            vx: sy * cp * 92.,
-            vy: sp * 92.,
-            vz: -cy * cp * 92.,
-            remaining: 4.2,
+            vx: sy * cp * speed,
+            vy: sp * speed,
+            vz: -cy * cp * speed,
+            remaining: crate::vehicle_gun::MAX_SHOT_TRAVEL / speed,
         };
         self.next_shell += 1;
         self.shells.push(shell);
@@ -2268,7 +2278,7 @@ impl Match {
             && q.team.as_deref() == Some(p.team.as_str())
             && q.level == 1
             && q.hp == q.max_hp
-            && q.fracture.broken.is_empty()
+            && !q.fracture.missing_material()
             && self.logistics.ray(eye, direction, distance, None).is_none())
         .then_some(i)
     }
@@ -2297,7 +2307,8 @@ impl Match {
                 }
             } else if obj.built
                 && obj.team.as_ref() == Some(&p.team)
-                && obj.hp.unwrap_or(0.) + 1. < obj.max_hp.unwrap_or(0.)
+                && (obj.hp.unwrap_or(0.) + 1. < obj.max_hp.unwrap_or(0.)
+                    || obj.fracture.missing_material())
             {
                 "[E] Починить укрытие · 1 дерево"
             } else {
@@ -2369,14 +2380,7 @@ impl Match {
             }
             p.wood -= 1;
             if o.layout.is_some() {
-                let revision = o.fracture.revision.wrapping_add(1);
-                let mut keep = o.fracture.broken.clone();
-                for id in keep.iter().copied().take(3).collect::<Vec<_>>() {
-                    keep.remove(&id);
-                }
-                o.fracture = FractureState::default();
-                o.fracture.revision = revision;
-                o.fracture.broken = keep;
+                o.fracture.repair(3);
                 o.rebuild_rubble();
                 self.nav = None;
             }
@@ -2459,6 +2463,9 @@ impl Match {
                 if !p.rubble.is_empty() { o["rubble"]=json!(p.rubble); }
                 if p.layout.is_some() {
                     o["broken"] = json!(p.fracture.broken);
+                    if p.fracture.packed_cuts().next().is_some() {
+                        o["cuts"] = json!(p.fracture.packed_cuts().collect::<Vec<_>>());
+                    }
                     o["revision"] = json!(p.fracture.revision);
                     if p.fracture.scar_revision != 0 {
                         o["scarRevision"] = json!(p.fracture.scar_revision);
@@ -2486,6 +2493,9 @@ impl Match {
                 if !p.rubble.is_empty() { o["rubble"]=json!(p.rubble); }
                 if p.layout.is_some() {
                     o["broken"] = json!(p.fracture.broken);
+                    if p.fracture.packed_cuts().next().is_some() {
+                        o["cuts"] = json!(p.fracture.packed_cuts().collect::<Vec<_>>());
+                    }
                     o["revision"] = json!(p.fracture.revision);
                     if p.fracture.scar_revision != 0 {
                         o["scarRevision"] = json!(p.fracture.scar_revision);
@@ -2864,8 +2874,8 @@ mod tests {
         assert_eq!(m.snapshot()["shells"].as_array().unwrap().len(), 1);
         let start = m.shells[0].clone();
         m.input(1, &json!({}));
-        advance(&mut m, 0.3);
-        assert!(m.shells[0].y < start.y - 0.20 && m.shells[0].z < start.z - 24.);
+        advance(&mut m, 0.1);
+        assert!(m.shells[0].y < start.y - 0.02 && m.shells[0].z < start.z - 24.);
         assert!(m.shells[0].vy < 0.);
         assert!(!m.props[0].dead && m.events.iter().all(|e| e["type"] != "shellImpact"));
         advance(&mut m, 0.40);
@@ -2874,6 +2884,52 @@ mod tests {
             && e["shellId"] == start.id
             && e["impactMaterial"] == "fence"));
         assert_eq!(m.players[&1].ammo, 8);
+    }
+    #[test]
+    fn side_contact_hits_the_seated_buggy_driver_but_closed_armor_covers_crew() {
+        for kind in ["scout_buggy", "apc", "mbt", "cargo6x6", "patrol4x4"] {
+            let mut m = vehicle_lane(kind, json!([]));
+            let mut attacker = m.players.remove(&2).unwrap();
+            let driver = m.players.get_mut(&1).unwrap();
+            driver.hp = 1.;
+            driver.shield = 0.;
+            let start = [-5., 1.49, 20.09];
+            let forward = [1., 0., 0.];
+            m.trace_shot(&mut attacker, start, forward, 15., Strike::Infantry);
+            let state = m.snapshot();
+            if kind == "scout_buggy" {
+                assert!(!m.players[&1].alive);
+                assert!(state["vehicles"][0]["driver"].is_null());
+                assert_eq!(state["vehicles"][0]["hp"], 95.);
+                assert!(matches!(m.first_contact(&attacker, start, forward, 15., None).surface, Contact::Range));
+            } else {
+                assert!(m.players[&1].alive);
+                assert_eq!(state["vehicles"][0]["driver"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn armored_shots_cross_the_lane_quickly_but_cannot_skip_a_thin_surface() {
+        for kind in ["mbt", "apc"] {
+            let mut m = vehicle_lane(kind, json!([
+                {"kind":"fence","x":0,"z":-38.1,"w":8.,"h":4.,"d":0.12,"hp":55.,"solid":true}
+            ]));
+            m.input(1, &json!({"shoot":true,"apcRounds":true,"yaw":0.,"pitch":0.}));
+            advance(&mut m, 0.15);
+            assert_eq!(m.shells.len(), 1);
+            assert!(!m.events.iter().any(|e| e["type"] == "shellImpact"));
+            advance(&mut m, 0.15);
+            assert!(m.shells.is_empty());
+            let event = m.events.iter().find(|e| e["type"] == "shellImpact").unwrap();
+            assert!((event["z"].as_f64().unwrap() + 38.04).abs() < 0.035);
+            for _ in 0..18 {
+                m.input(1, &json!({"shoot":true,"apcRounds":true}));
+                m.step(0.05);
+            }
+            let shots = m.events.iter().filter(|e| e["type"] == "tankFire").count();
+            assert_eq!(shots, if kind == "apc" { 3 } else { 1 });
+        }
     }
     #[test]
     fn buggy_and_carrier_have_different_authoritative_roles_and_performance() {
@@ -3012,6 +3068,26 @@ mod tests {
         advance(&mut m, 10.5);
         assert!(m.round > snapshot["round"].as_u64().unwrap() as u32);
         assert!(m.snapshot()["propChanges"].as_array().unwrap().is_empty());
+    }
+    #[test]
+    fn shallow_wall_damage_is_sent_with_the_same_cut_seen_by_the_server() {
+        let mut m = skirmish(json!([{"kind":"wall","x":0,"z":0,"w":6,"h":1.6,"d":1,"solid":true}]));
+        let p = m.players[&1].clone();
+        m.damage_prop(0, [0.3, 0.8, 0.5], Damage::Grenade, 30., &p);
+        let baseline = m.snapshot()["propChanges"][0].clone();
+        let codes = baseline["cuts"].as_array().unwrap();
+        assert!(!codes.is_empty() && baseline["broken"].as_array().unwrap().is_empty());
+        assert!(m.events.iter().any(|e| e["type"] == "fracture" && e["chips"].as_array().is_some_and(|c| !c.is_empty())));
+        let live = m.props[0].ray([0.3, 0.8, 2.], [0., 0., -1.], 3.);
+        let mut late = FractureState::default();
+        late.replace_cuts(codes.iter().map(|n| n.as_u64().unwrap() as u32));
+        let layout = m.props[0].layout.as_ref().unwrap();
+        assert_eq!(live,layout.ray(&late, [0.3, 0.8, 2.], [0., 0., -1.], 3.));
+        m.add_player(3, "Late");
+        assert_eq!(m.snapshot()["propChanges"][0], baseline);
+        let before = m.props[0].fracture.packed_cuts().count();
+        m.props[0].fracture.repair(3);
+        assert_eq!(m.props[0].fracture.packed_cuts().count(), before.saturating_sub(3));
     }
     #[test]
     fn combat_authority_team_shield_hit_scoring_and_respawn() {

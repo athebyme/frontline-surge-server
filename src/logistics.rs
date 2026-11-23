@@ -129,7 +129,7 @@ struct Vehicle {
     impact_delay: f32,
     #[serde(skip)]
     spawn: VehicleSpawn,
-    #[serde(skip)]
+    #[serde(rename = "gunRemaining")]
     cooldown: f32,
     #[serde(skip)]
     salvage: u32,
@@ -189,6 +189,16 @@ impl Vehicle {
             0.
         }
     }
+    fn sight_line(&self, o: [f32; 3], d: [f32; 3]) -> crate::buggy::SightLine {
+        crate::buggy::SightLine::new(self.x, self.z, self.yaw, o, d)
+    }
+    fn ray(&self, o: [f32; 3], d: [f32; 3], limit: f32) -> Option<f32> {
+        if self.kind == "scout_buggy" && !self.destroyed {
+            self.sight_line(o, d).hull(limit)
+        } else {
+            self.shape().ray(o, d, limit)
+        }
+    }
     fn shape(&self) -> Prop {
         let b = spec(&self.kind);
         let mut p = Prop {
@@ -243,6 +253,16 @@ impl Logistics {
             direction: ray.direction,
             vehicle_kind,
         })
+    }
+    pub(crate) fn exposed_driver_target(&self, index: usize) -> Option<[f32; 3]> {
+        let v = self.vehicles.get(index)?;
+        (v.kind == "scout_buggy" && !v.destroyed && v.driver.is_some())
+            .then(|| crate::buggy::world_point(v.x, v.z, v.yaw, crate::buggy::EYE))
+    }
+    pub(crate) fn driver_ray(&self, index: usize, o: [f32; 3], d: [f32; 3], limit: f32) -> Option<f32> {
+        let v = self.vehicles.get(index)?;
+        if v.kind != "scout_buggy" || v.destroyed || v.driver.is_none() { return None; }
+        v.sight_line(o, d).driver(limit)
     }
     pub(crate) fn hull_kind(&self, index: usize) -> Option<&str> {
         self.vehicles.get(index).map(|v| v.kind.as_str())
@@ -313,7 +333,7 @@ impl Logistics {
                 !(ignore_driver.is_some() && v.driver == ignore_driver)
                     && Some(v.id) != ignore_vehicle
             })
-            .filter_map(|(i, v)| v.shape().ray(o, d, limit).map(|t| (i, t)))
+            .filter_map(|(i, v)| v.ray(o, d, limit).map(|t| (i, t)))
             .min_by(|a, b| a.1.total_cmp(&b.1))
     }
     pub(crate) fn blast_targets(&self, x: f32, z: f32, r: f32) -> Vec<(usize, f32, f32, f32)> {
@@ -768,7 +788,7 @@ impl Logistics {
             let mount = crate::vehicle_gun::Mount::for_kind(&v.kind).expect("armed vehicle mount");
             let ray = mount.ray(x,z,yaw,v.turret_yaw,p.pitch,false);
             v.shells -= 1;
-            v.cooldown = if apc_rounds { 1.65 } else { 3.6 };
+            v.cooldown = if apc_rounds { crate::vehicle_gun::APC_RELOAD } else { crate::vehicle_gun::TANK_RELOAD };
             p.shield = 0.;
             events.push(json!({"type":"tankFire","actor":p.id,"x":ray.origin[0],"y":ray.origin[1],"z":ray.origin[2],"yaw":v.turret_yaw,"pitch":ray.pitch,"vehicleId":v.id,"weapon":if apc_rounds {"apc_he"} else {"tank"},"reloadTime":v.cooldown}));
         }

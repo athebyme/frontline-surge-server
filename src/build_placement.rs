@@ -191,7 +191,7 @@ impl Match {
                     }
                     let alignment = (yaw - raw.yaw).cos().abs();
                     let (jx, jz) = world(end.0, end.1);
-                    if !base.fracture.broken.is_empty() {
+                    if base.fracture.missing_material() {
                         // A breached endpoint has no surviving face to attach to.
                         let dx = base.x - jx;
                         let dz = base.z - jz;

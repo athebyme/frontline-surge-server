@@ -147,7 +147,7 @@ fn two_real_clients_share_one_dedicated_authority() {
     old.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
     send(
         &mut old,
-        json!({"type":"join","version":4,"name":"outdated"}),
+        json!({"type":"join","version":frontline_surge::PROTOCOL - 1,"name":"outdated"}),
     );
     assert_eq!(read(&mut old)["type"], "error");
     server.quit();

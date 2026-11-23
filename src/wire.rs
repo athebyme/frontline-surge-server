@@ -10,7 +10,7 @@ struct Outgoing {
     replaceable: bool,
 }
 
-pub const PROTOCOL: u64 = 5;
+pub const PROTOCOL: u64 = 6;
 pub(crate) const SERVER_PACKET: usize = 4 * 1024 * 1024;
 #[cfg(feature = "server")]
 pub(crate) const INPUT_PACKET: usize = 4096;
