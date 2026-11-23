@@ -71,6 +71,82 @@ fn cargo_totals(p: &Player, v: &Vehicle) -> [u32; 5] {
 }
 
 #[test]
+fn a_turn_bends_the_travel_direction_gradually_and_reverse_unwinds_the_wheels() {
+    let mut l = pool("patrol4x4");
+    let mut p = player(1, "blue", 2.3, 0.);
+    action(&mut l, &mut p, &[], "vehicle");
+    for _ in 0..20 {
+        l.update(&mut p, &json!({"forward":1}), 0.05, &[], &bounds());
+    }
+    let (x, z) = (p.x, p.z);
+    l.update(&mut p, &json!({"forward":1,"strafe":1}), 0.05, &[], &bounds());
+    let heading = (p.x - x).atan2(z - p.z);
+    assert!(heading > 0. && heading < l.vehicles[0].yaw);
+
+    for _ in 0..40 {
+        l.update(&mut p, &json!({"forward":-1}), 0.05, &[], &bounds());
+    }
+    let travel = l.vehicles[0].travel;
+    let (x, z) = (p.x, p.z);
+    l.update(&mut p, &json!({"forward":-1}), 0.05, &[], &bounds());
+    assert!(l.vehicles[0].speed < 0.);
+    assert!((travel - l.vehicles[0].travel - distance(x, z, p.x, p.z)).abs() < 0.001);
+}
+
+#[test]
+fn debug_service_selects_only_live_friendly_vehicles_and_prefers_the_driver_seat() {
+    let mut l = Logistics::default();
+    let mut enemy = spawn("mbt", 0.);
+    enemy.team = "red".into();
+    l.reset(&[
+        enemy,
+        spawn("mbt", 0.),
+        spawn("apc", 2.),
+        spawn("mbt", 5.),
+    ]);
+    l.vehicles[1].destroyed = true;
+    for v in &mut l.vehicles {
+        v.hp = 1.;
+        v.fuel = 2.;
+        v.mg_ammo = 3;
+        v.shells = 0;
+    }
+    let mut p = player(1, "blue", 0., 0.);
+    l.debug_vehicle_service(&mut p);
+    let apc = &l.vehicles[2];
+    assert_eq!(
+        (apc.hp, apc.fuel, apc.mg_ammo),
+        (apc.max_hp, apc.max_fuel, apc.mg_capacity)
+    );
+    assert_eq!(apc.shells, 0);
+    assert_eq!(l.vehicles[0].hp, 1.);
+    assert_eq!(l.vehicles[1].hp, 1.);
+    assert_eq!(l.vehicles[3].hp, 1.);
+
+    l.vehicles[2].hp = 7.;
+    l.vehicles[3].driver = Some(p.id);
+    l.vehicles[3].max_hp += 80.;
+    l.vehicles[3].max_fuel += 10.;
+    l.debug_vehicle_service(&mut p);
+    let tank = &l.vehicles[3];
+    assert_eq!(
+        (tank.hp, tank.fuel, tank.mg_ammo, tank.shells),
+        (tank.max_hp, tank.max_fuel, tank.mg_capacity, MAX_TANK_SHELLS)
+    );
+    assert_eq!(l.vehicles[2].hp, 7.);
+    l.vehicles[3].driver = None;
+
+    p.alive = false;
+    l.debug_vehicle_service(&mut p);
+    assert_eq!(l.vehicles[2].hp, 7.);
+    p.alive = true;
+    p.x = 15.;
+    l.debug_vehicle_service(&mut p);
+    assert_eq!(l.vehicles[2].hp, 7.);
+    assert_eq!(p.message, "Подойди к союзной машине");
+}
+
+#[test]
 fn cargo_is_team_owned_conserves_each_resource_and_respects_both_capacity_limits() {
     let mut l = pool("cargo6x6");
     let mut ally = player(7, "blue", 2.8, 0.);

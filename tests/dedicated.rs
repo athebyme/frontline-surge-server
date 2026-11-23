@@ -257,6 +257,7 @@ fn developer_grants_require_server_opt_in_and_loopback_connection() {
     fn issue(address: SocketAddr, enabled: bool) {
         let (mut player, welcome) = join(address, "Operator", "blue");
         assert_eq!(welcome["developer"], enabled);
+        assert_eq!(welcome["vehicleService"], enabled);
         let id = &welcome["id"];
         let metal = |state: &Value| {
             state["players"]
@@ -281,6 +282,28 @@ fn developer_grants_require_server_opt_in_and_loopback_connection() {
         for _ in 0..3 {
             until(&mut player, |s| metal(s) == expected);
         }
+        send(
+            &mut player,
+            json!({"type":"debug","op":"vehicleService","developer":true}),
+        );
+        send(&mut player, json!({"type":"input","seq":1}));
+        until(&mut player, |s| {
+            let operator = s["players"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| &p["id"] == id)
+                .unwrap();
+            if operator["seq"] != 1 {
+                return false;
+            }
+            let handled = matches!(
+                operator["message"].as_str(),
+                Some("Подойди к союзной машине" | "Машина отремонтирована, топливо и боезапас пополнены")
+            );
+            assert_eq!(handled, enabled);
+            true
+        });
     }
     let (mut normal, address) = launch(0, 120);
     issue(address, false);

@@ -192,6 +192,8 @@ pub(crate) struct Prop {
     pub(crate) hp: Option<f32>,
     pub(crate) max_hp: Option<f32>,
     pub(crate) resource: Option<String>,
+    #[serde(skip_serializing)]
+    pub(crate) base_supply: bool,
     pub(crate) stock: u32,
     pub(crate) dead: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -201,6 +203,8 @@ pub(crate) struct Prop {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) team: Option<String>,
     pub(crate) built: bool,
+    #[serde(skip_serializing_if = "is_ground_level_default")]
+    pub(crate) level: u8,
     #[serde(skip)]
     pub(crate) capacity: u32,
     #[serde(skip)]
@@ -233,6 +237,13 @@ fn object_damage(kind: &str, style: Option<&str>, source: Damage, incoming: f32)
             Damage::Grenade => 0.25,
             Damage::Tank => 1.,
         }
+    } else if kind == "stone" {
+        match source {
+            Damage::Bullet(_) => 0.,
+            Damage::Ram(_) => 0.16,
+            Damage::Grenade => 0.32,
+            Damage::Tank => 0.65,
+        }
     } else if kind == "apc" {
         match source {
             Damage::Bullet(_) => 0.28,
@@ -252,6 +263,10 @@ fn object_damage(kind: &str, style: Option<&str>, source: Damage, incoming: f32)
     };
     incoming * scale
 }
+fn is_ground_level_default(level: &u8) -> bool {
+    *level == 0
+}
+
 impl Prop {
     fn wood_tree(&self) -> bool {
         matches!(self.kind.as_str(), "tree" | "pine")
@@ -272,6 +287,7 @@ impl Prop {
         self.hp = self.hp.or(match self.kind.as_str() {
             "tree" => Some(125.),
             "pine" => Some(110.),
+            "stone" => Some(260.),
             "fence" => Some(76.),
             "pole" => Some(92.),
             "wall" | "logs" => Some(140.),
@@ -487,6 +503,7 @@ struct Edges {
     interact: bool,
     build: bool,
     place: bool,
+    expected_support: Option<Option<u64>>,
     trigger: bool,
     vehicle: bool,
     service: bool,
@@ -1002,7 +1019,10 @@ impl Match {
         p.edges.reload |= held(input, "reload");
         p.edges.interact |= held(input, "interact");
         p.edges.build |= held(input, "build");
-        p.edges.place |= held(input, "place");
+        if held(input, "place") {
+            p.edges.place = true;
+            p.edges.expected_support = input.get("supportBuildId").map(Value::as_u64);
+        }
         p.edges.vehicle |= held(input, "vehicle");
         p.edges.service |= held(input, "service");
         p.edges.upgrade |= held(input, "upgrade");
@@ -1129,6 +1149,19 @@ impl Match {
                 self.update(&mut p, dt);
             }
             self.players.insert(id, p);
+            if self.phase == "ended" {
+                return;
+            }
+        }
+        for (actor, team, events) in self.logistics.coast(dt, &self.props, &self.level.bounds) {
+            // A released vehicle can still hit something after its driver disconnects.
+            if let Some(mut driver) = self.players.remove(&actor) {
+                self.ingest_logistics(events, &mut driver);
+                self.players.insert(actor, driver);
+            } else {
+                let mut driver = Player { id: actor, team, name: "Техника".into(), ..Default::default() };
+                self.ingest_logistics(events, &mut driver);
+            }
             if self.phase == "ended" {
                 return;
             }
@@ -1387,16 +1420,20 @@ impl Match {
         }
         if p.build_mode {
             p.gate.reset();
-            let (wall, clear) = self.preview(p);
+            let (wall, support, clear) = self.preview(p);
+            let support_id = support.and_then(|i| self.props[i].build_id);
+            let base_y = support.map_or(0., |i| self.props[i].h);
             let (wood, metal) = Self::build_cost(&wall.kind);
-            let has_space = self.team_build_room(&p.team);
+            let has_space = support.is_some() || self.team_build_room(&p.team);
             let valid = clear && has_space && p.wood >= wood && p.metal >= metal;
             p.preview = Some(
-                json!({"kind":wall.kind,"x":wall.x,"z":wall.z,"yaw":wall.yaw,"w":wall.w,"h":wall.h,"d":wall.d,
-                "valid":valid,"clear":clear,"teamLimit":!has_space}),
+                json!({"kind":wall.kind,"x":wall.x,"y":base_y,"z":wall.z,"yaw":wall.yaw,"w":wall.w,"h":wall.h,"d":wall.d,
+                "level":wall.level,"team":wall.team,"supportBuildId":support_id,"valid":valid,"clear":clear,"teamLimit":!has_space}),
             );
             if action.place {
-                if !has_space {
+                if action.expected_support.is_some_and(|id| id != support_id.map(u64::from)) {
+                    p.notice("Опора изменилась");
+                } else if !has_space {
                     p.notice("Лимит команды · 64 постройки");
                 } else if !clear {
                     p.notice("Здесь мало места");
@@ -1404,7 +1441,17 @@ impl Match {
                     p.notice(&format!("Нужно дерева: {wood}, металла: {metal}"));
                 } else {
                     let kind = wall.kind.clone();
-                    if let Some(slot) = self.dynamic(wall) {
+                    let slot = if let Some(i) = support {
+                        let mut combined = self.props[i].clone();
+                        combined.level = wall.level;
+                        combined.h += wall.h;
+                        combined.hp = combined.hp.zip(wall.hp).map(|(base, upper)| base + upper);
+                        combined.max_hp = combined.hp;
+                        self.write_dynamic(combined, Some(i))
+                    } else {
+                        self.dynamic(wall)
+                    };
+                    if let Some(slot) = slot {
                         p.wood -= wood;
                         p.metal -= metal;
                         p.build_mode = false;
@@ -1718,7 +1765,7 @@ impl Match {
         nonstructural: f32,
         p: &Player,
     ) {
-        if self.props[i].dead {
+        if self.props[i].dead || self.props[i].base_supply {
             return;
         }
         if let Some(layout) = self.props[i].layout.clone() {
@@ -2032,6 +2079,17 @@ impl Match {
             let Some(kind) = ev["type"].as_str().map(str::to_owned) else {
                 continue;
             };
+            if kind == "runOver" {
+                if let Some(target) = ev["target"].as_u64().map(|id| id as u32) {
+                    if self.logistics.driver_vehicle(target).is_none() {
+                        self.harm(p, target, 100., "ram", false);
+                    }
+                }
+                if self.phase == "ended" {
+                    break;
+                }
+                continue;
+            }
             if kind == "vehicleImpact" {
                 if let Some(i) = ev["index"]
                     .as_u64()
@@ -2089,7 +2147,7 @@ impl Match {
     }
     /// Slots remain stable for spatial updates. buildId identifies their actual
     /// occupant and changes even if a new object reuses the very same position.
-    fn dynamic(&mut self, mut obj: Prop) -> Option<usize> {
+    fn dynamic(&mut self, obj: Prop) -> Option<usize> {
         let first = self.level.props.len();
         let slots = &self.props[first..];
         let replace = if obj.built {
@@ -2119,12 +2177,14 @@ impl Match {
         if replace.is_none() && slots.len() >= DYNAMIC_LIMIT {
             return None;
         }
+        self.write_dynamic(obj, replace.map(|offset| first + offset))
+    }
+    fn write_dynamic(&mut self, mut obj: Prop, replace: Option<usize>) -> Option<usize> {
         obj.build_id = Some(self.next_build_id);
         self.next_build_id = self.next_build_id.checked_add(1)?;
         obj.prepare_geometry();
         obj.initialize_layout();
-        let slot = if let Some(i) = replace {
-            let slot = first + i;
+        let slot = if let Some(slot) = replace {
             self.logistics.forget_site(slot);
             self.props[slot] = obj;
             slot
@@ -2201,7 +2261,27 @@ impl Match {
             _ => (3, 1),
         }
     }
-    fn preview(&self, p: &Player) -> (Prop, bool) {
+    fn wall_support(&self, p: &Player) -> Option<usize> {
+        let eye = [p.x, EYE, p.z];
+        let (sy, cy) = p.yaw.sin_cos();
+        let (sp, cp) = p.pitch.sin_cos();
+        let direction = [sy * cp, sp, -cy * cp];
+        let reach = 5.;
+        let support = self.props[self.level.props.len()..]
+            .iter()
+            .any(|q| q.kind == "barricade" && !q.dead && q.footprint(p.x, p.z) <= reach * reach);
+        if !support {
+            return None;
+        }
+        let (hit, distance) = self.ray(eye, direction, reach);
+        let i = hit?;
+        let q = &self.props[i];
+        (q.built && q.kind == "barricade" && q.team.as_deref() == Some(&p.team)
+            && q.level == 1 && q.hp == q.max_hp && q.fracture.broken.is_empty()
+            && self.logistics.ray(eye, direction, distance, None).is_none())
+            .then_some(i)
+    }
+    fn preview(&self, p: &Player) -> (Prop, Option<usize>, bool) {
         let (sn, cs) = p.yaw.sin_cos();
         let kind = p.build_kind.as_str();
         let (w, d, h, hp) = match kind {
@@ -2225,6 +2305,15 @@ impl Match {
             max_hp: Some(hp),
             ..Default::default()
         };
+        let support = if kind == "wall" { self.wall_support(p) } else { None };
+        build.level = 1;
+        if let Some(i) = support {
+            let base = &self.props[i];
+            build.x = base.x;
+            build.z = base.z;
+            build.yaw = base.yaw;
+            build.level = 2;
+        }
         build.prepare_geometry();
         let b = &self.level.bounds;
         let mut clear = build.x - build.world_rx >= b.min_x
@@ -2244,7 +2333,8 @@ impl Match {
             && self
                 .props
                 .iter()
-                .all(|q| q.dead || !q.solid || !build.touches(q));
+                .enumerate()
+                .all(|(i, q)| Some(i) == support || q.dead || !q.solid || !build.touches(q));
         // Tile the oriented build footprint with small conservative circles for
         // dynamic vehicle clearance, including long hulls and each corner.
         let nx = (w / 0.35).ceil() as i32;
@@ -2255,8 +2345,8 @@ impl Match {
                     let lx = (i as f32 / nx as f32 - 0.5) * w;
                     let lz = (j as f32 / nz as f32 - 0.5) * d;
                     if self.logistics.blocked(
-                        build.x + cs * lx - sn * lz,
-                        build.z + sn * lx + cs * lz,
+                        build.x + build.cs * lx - build.sn * lz,
+                        build.z + build.sn * lx + build.cs * lz,
                         0.24,
                         None,
                     ) {
@@ -2266,7 +2356,7 @@ impl Match {
                 }
             }
         }
-        (build, clear)
+        (build, support, clear)
     }
     fn target(&self, p: &Player) -> Option<(usize, &'static str)> {
         let mut nearest = f32::INFINITY;
@@ -2542,6 +2632,57 @@ mod tests {
         m
     }
     #[test]
+    fn released_vehicle_rolls_to_a_stop_and_uses_the_same_travel_on_all_snapshots() {
+        let mut m = vehicle_lane("patrol4x4", json!([]));
+        for _ in 0..30 {
+            m.input(1, &json!({"forward":1}));
+            m.step(0.05);
+        }
+        let before = m.snapshot()["vehicles"][0].clone();
+        m.input(1, &json!({}));
+        advance(&mut m, 0.25);
+        let released = m.snapshot()["vehicles"][0].clone();
+        assert!(released["speed"].as_f64().unwrap() < before["speed"].as_f64().unwrap());
+        assert!(released["z"].as_f64().unwrap() < before["z"].as_f64().unwrap() - 2.);
+
+        m.input(1, &json!({"vehicle":true}));
+        m.step(0.05);
+        let exit = m.snapshot()["vehicles"][0].clone();
+        assert!(exit["driver"].is_null());
+        assert!(exit["speed"].as_f64().unwrap() > 8.);
+        advance(&mut m, 5.);
+        let stopped = m.snapshot()["vehicles"][0].clone();
+        let rolled = exit["z"].as_f64().unwrap() - stopped["z"].as_f64().unwrap();
+        let wheel_travel = stopped["travel"].as_f64().unwrap() - exit["travel"].as_f64().unwrap();
+        assert!(rolled > 5.);
+        assert!((wheel_travel - rolled).abs() < 0.001);
+        assert_eq!(stopped["speed"], 0.);
+        assert_eq!(stopped["fuel"], exit["fuel"]);
+        advance(&mut m, 0.5);
+        assert_eq!(stopped, m.snapshot()["vehicles"][0]);
+    }
+    #[test]
+    fn moving_vehicle_eliminates_enemy_infantry_after_driver_disembarks() {
+        let mut m = vehicle_lane("mbt", json!([]));
+        for _ in 0..50 {
+            m.input(1, &json!({"forward":1}));
+            m.step(0.05);
+        }
+        let z = m.players[&1].z;
+        let target = m.players.get_mut(&2).unwrap();
+        target.x = 0.;
+        target.z = z - 6.;
+        target.shield = 0.;
+        m.input(1, &json!({"vehicle":true}));
+        m.step(0.05);
+        assert!(m.snapshot()["vehicles"][0]["driver"].is_null());
+        advance(&mut m, 1.);
+        assert!(!m.players[&2].alive);
+        assert_eq!(m.players[&1].kills, 1);
+        assert_eq!(m.blue, 1);
+        assert!(m.events.iter().any(|e| e["type"] == "kill" && e["weapon"] == "ram"));
+    }
+    #[test]
     fn momentum_breaks_a_real_wooden_gap_but_an_intact_steel_wall_stops_the_hull() {
         let mut m = vehicle_lane(
             "mbt",
@@ -2781,6 +2922,69 @@ mod tests {
         assert!(m.players[&2].alive);
         assert!(m.players[&2].shield > 0.);
     }
+    #[test]
+    fn upper_wall_uses_aimed_intact_support_and_preserves_its_slot() {
+        let mut m = skirmish(json!([]));
+        let builder = m.players.get_mut(&1).unwrap();
+        builder.wood = 12;
+        builder.metal = 4;
+        act(&mut m, json!({"build":true, "yaw":0}));
+        act(&mut m, json!({"place":true, "supportBuildId":null}));
+        let first_id = m.props[0].build_id.unwrap();
+        let x = m.props[0].x;
+        let z = m.props[0].z;
+        let height = m.props[0].h;
+        act(&mut m, json!({"build":true, "pitch":-0.28}));
+
+        let preview = m.players[&1].preview.as_ref().unwrap();
+        assert_eq!(preview["level"], 2);
+        assert_eq!(preview["supportBuildId"], first_id);
+        assert_eq!(preview["y"], json!(height));
+        assert_eq!(preview["valid"], true);
+
+        let player = m.players[&1].clone();
+        let mut enemy = player.clone();
+        enemy.team = "red".into();
+        assert!(m.wall_support(&enemy).is_none());
+        m.props[0].hp = Some(139.);
+        assert!(m.wall_support(&player).is_none());
+        m.props[0].hp = m.props[0].max_hp;
+        m.props[0].fracture.broken.insert(0);
+        assert!(m.wall_support(&player).is_none());
+        m.props[0].fracture.broken.clear();
+
+        act(&mut m, json!({"place":true,"supportBuildId":first_id+1}));
+        assert_eq!((m.players[&1].wood, m.players[&1].metal), (9,3));
+        assert_eq!(m.props[0].build_id, Some(first_id));
+        act(&mut m, json!({"place":true,"supportBuildId":first_id}));
+        assert_eq!((m.players[&1].wood, m.players[&1].metal), (6,2));
+        assert_eq!(m.props.len(), 1);
+        let wall = &m.snapshot()["builtProps"][0];
+        assert_eq!(wall["level"], 2);
+        assert_eq!(wall["h"], json!(height*2.));
+        assert_eq!(wall["hp"], 280.);
+        assert_ne!(wall["buildId"], first_id);
+        assert!(m.props[0].ray([x, 2., z+2.], [0.,0.,-1.], 4.).is_some());
+
+        act(&mut m, json!({"build":true}));
+        act(&mut m, json!({"place":true}));
+        assert_eq!(m.players[&1].preview.as_ref().unwrap()["valid"], false);
+        assert_eq!((m.players[&1].wood, m.players[&1].metal), (6,2));
+        // Damage reaches the bottom courses; their disappearance takes unsupported cells with them.
+        for _ in 0..20 {
+            m.damage_prop(0, [x,-0.85,z], Damage::Ram(90.), 45., &player);
+            if m.props[0].dead { break; }
+        }
+        assert!(m.props[0].dead);
+        assert!(m.events.iter().any(|e| e["type"]=="fracture" && e["collapsed"]==true));
+        assert_eq!(m.snapshot()["builtProps"][0]["dead"], true);
+        assert!(m.props[0].ray([x, 2., z+2.], [0.,0.,-1.], 4.).is_none());
+        // A delayed placement aimed at the vanished support cannot become a fresh ground wall.
+        act(&mut m, json!({"place":true,"supportBuildId":first_id}));
+        assert!(m.props[0].dead);
+        assert_eq!((m.players[&1].wood, m.players[&1].metal), (6,2));
+    }
+
     #[test]
     fn salvage_build_repair_restock_and_map_reset() {
         let mut m = skirmish(json!([
@@ -3219,6 +3423,56 @@ mod tests {
         assert!(rifle.range > ar4.range && ar4.range > smg.range);
         assert_eq!(m.snapshot()["roundSeconds"], 7200);
         assert_eq!(m.snapshot()["fragLimit"], 0);
+    }
+    #[test]
+    fn only_headquarters_supply_props_survive_heavy_damage() {
+        let mut m = Match::new();
+        m.add_player(1, "Blue");
+        let p = m.players[&1].clone();
+        let mut protected = 0;
+        let mut field_powder = 0;
+        for i in 0..m.level.props.len() {
+            let o = &m.props[i];
+            if !o.base_supply && o.resource.as_deref() != Some("gunpowder") {
+                continue;
+            }
+            let base_supply = o.base_supply;
+            let health = o.hp;
+            let stock = o.stock;
+            let at = [o.x, 0.5, o.z];
+            for damage in [Damage::Grenade, Damage::Ram(160.), Damage::Tank] {
+                m.damage_prop(i, at, damage, 160., &p);
+            }
+            let o = &m.props[i];
+            if base_supply {
+                protected += 1;
+                assert!(!o.dead && !o.dirty);
+                assert_eq!((o.hp, o.stock), (health, stock));
+            } else {
+                field_powder += 1;
+                assert!(o.dead && o.dirty && o.restock_at.is_some());
+            }
+        }
+        assert_eq!((protected, field_powder), (8, 2));
+    }
+    #[test]
+    fn equal_strength_impacts_break_wood_before_stone() {
+        for source in [Damage::Grenade, Damage::Ram(130.), Damage::Tank] {
+            let mut m = skirmish(json!([
+                {"kind":"fence","w":2,"h":2,"d":1,"solid":true,"hp":100},
+                {"kind":"stone","w":2,"h":2,"d":1,"solid":true,"hp":100},
+            ]));
+            let p = m.players[&1].clone();
+            for i in 0..2 {
+                m.damage_prop(i, [0., 1., 0.], source, 130., &p);
+            }
+            assert!(m.props[0].dead);
+            assert!(!m.props[1].dead && m.props[1].hp.unwrap() < 100.);
+            for _ in 0..5 {
+                m.damage_prop(1, [0., 1., 0.], source, 130., &p);
+            }
+            assert!(m.props[1].dead);
+        }
     }
     #[test]
     fn inventory_cap_stock_and_destroyed_depot_reconstruction() {

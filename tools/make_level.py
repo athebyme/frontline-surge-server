@@ -96,8 +96,8 @@ def generate():
             field(kind,side*x,side*z,w,d,yaw)
         def site(key,kind,left,right,x,z,owned=False):
             marker(f'{team}-{key}',kind,left if allied else right,side*x,side*z,team if owned else None)
-        def stock(kind,x,z,w,d,h,res,amount,yaw=0):
-            local(kind,x,z,w,d,h,yaw,resource=res,stock=amount)
+        def stock(kind,x,z,w,d,h,res,amount,yaw=0,**extra):
+            local(kind,x,z,w,d,h,yaw,resource=res,stock=amount,**extra)
         site('base','base','Западный технопарк','Восточный терминал',-232,143,True)
         site('oil','oil','Промысел Бельвю','Промысел Сен-Пьер',-90,-157)
         site('mill','sawmill','Лесокомбинат «Леруа»','Лесокомбинат «Вернье»',-147,157)
@@ -132,10 +132,10 @@ def generate():
         local('house',-257,93,9,8,6.3,-.25,hp=380,variant=0)
         local('wall',-234,151,7.2,.8,1.2,-.07,hp=130)
         local('sandbag',-245,137,3.6,.85,1.0,.2,hp=120)
-        stock('logs',-234,138,2.55,1.65,1.15,'wood',24)
-        stock('barrels',-226.1,137.4,1.85,1.6,1.25,'metal',18)
-        stock('crate',-235,148,1.6,1.3,.95,'ammo',20)
-        stock('crate',-224,146.5,1.7,1.3,1.05,'gunpowder',22)
+        stock('logs',-234,138,2.55,1.65,1.15,'wood',24,baseSupply=True)
+        stock('barrels',-226.1,137.4,1.85,1.6,1.25,'metal',18,baseSupply=True)
+        stock('crate',-235,148,1.6,1.3,.95,'ammo',20,baseSupply=True)
+        stock('crate',-224,146.5,1.7,1.3,1.05,'gunpowder',22,baseSupply=True)
 
         # Pump and gantry stand beside, never on, the two access roads.
         local('oilwell',-90,-157,6.2,5.2,9.4,-.14,resource='oil',stock=150)

@@ -39,6 +39,10 @@ impl Match {
                 let gained = *slot - was;
                 p.notice(&format!("Отладка · получено {gained} ед."));
             }
+            Some("vehicleService") => {
+                let p = self.players.get_mut(&id).unwrap();
+                self.logistics.debug_vehicle_service(p);
+            }
             Some("refill") => {
                 let p = self.players.get_mut(&id).unwrap();
                 if !p.alive {

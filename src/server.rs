@@ -132,7 +132,7 @@ pub fn run(
                         .into();
                     retain_friendly_markers(&mut state, &peer.team);
                     let pack = Wire::packet(
-                        &json!({"type":"welcome","version":PROTOCOL,"id":id,"developer":peer.developer,"state":state}),
+                        &json!({"type":"welcome","version":PROTOCOL,"id":id,"developer":peer.developer,"vehicleService":peer.developer,"state":state}),
                     );
                     if peer.wire.enqueue(pack).is_err() {
                         peer.dead = true;

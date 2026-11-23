@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::f32::consts::{PI, TAU};
 
+const MAX_TANK_SHELLS: u32 = 12;
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct VehicleSpawn {
     pub(crate) kind: String,
@@ -97,6 +99,12 @@ struct Vehicle {
     yaw: f32,
     turret_yaw: f32,
     speed: f32,
+    #[serde(skip)]
+    course: f32,
+    #[serde(skip)]
+    last_driver: Option<u32>,
+    #[serde(skip)]
+    advanced_this_tick: bool,
     hp: f32,
     max_hp: f32,
     fuel: f32,
@@ -136,6 +144,9 @@ impl Vehicle {
             yaw: spawn.yaw,
             turret_yaw: spawn.yaw,
             speed: 0.,
+            course: spawn.yaw,
+            last_driver: None,
+            advanced_this_tick: false,
             hp: b.hp,
             max_hp: b.hp,
             fuel: b.fuel * 0.52,
@@ -240,7 +251,6 @@ impl Logistics {
     pub(crate) fn remove_player(&mut self, id: u32) {
         if let Some(i) = self.driver_vehicle(id) {
             self.vehicles[i].driver = None;
-            self.vehicles[i].speed = 0.;
         }
         self.selected.remove(&id);
         self.eject.remove(&id);
@@ -338,13 +348,13 @@ impl Logistics {
         );
         for i in 0..self.vehicles.len() {
             let v = &mut self.vehicles[i];
+            v.advanced_this_tick = false;
             v.cooldown = (v.cooldown - dt).max(0.);
             v.mg_delay = (v.mg_delay - dt).max(0.);
             v.impact_delay = (v.impact_delay - dt).max(0.);
             if let Some(id) = v.driver {
                 if !players.get(&id).is_some_and(|p| p.alive) {
                     v.driver = None;
-                    v.speed = 0.;
                 }
             }
             if !v.destroyed {
@@ -402,13 +412,24 @@ impl Logistics {
         }
     }
     fn vehicle_near(&self, p: &Player) -> Option<usize> {
-        if let Some(i) = self.driver_vehicle(p.id) {
+        self.vehicle_near_matching(p, |_| true)
+    }
+    fn vehicle_near_matching(
+        &self,
+        p: &Player,
+        eligible: impl Fn(&Vehicle) -> bool,
+    ) -> Option<usize> {
+        if let Some(i) = self
+            .driver_vehicle(p.id)
+            .filter(|&i| eligible(&self.vehicles[i]))
+        {
             return Some(i);
         }
         self.vehicles
             .iter()
             .enumerate()
             .filter(|(_, v)| (v.x - p.x).abs() < 7. && (v.z - p.z).abs() < 7.)
+            .filter(|(_, v)| eligible(v))
             .map(|(i, v)| (i, v.shape().footprint(p.x, p.z)))
             .filter(|(_, d)| *d <= 2.65f32.powi(2))
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -560,11 +581,11 @@ impl Logistics {
     fn fit(&self, i: usize, x: f32, z: f32, yaw: f32, scene: &[Prop], b: &Bounds) -> bool {
         self.obstruction(i, x, z, yaw, scene, b).is_none()
     }
-    fn drive(
+    fn advance_vehicle(
         &mut self,
         i: usize,
-        p: &mut Player,
-        input: &Value,
+        acceleration: f32,
+        turn: f32,
         dt: f32,
         scene: &[Prop],
         b: &Bounds,
@@ -572,8 +593,6 @@ impl Logistics {
         let v = &self.vehicles[i];
         let cfg = spec(&v.kind);
         let mut events = Vec::new();
-        let acceleration = val(input, "forward").clamp(-1., 1.);
-        let turn = val(input, "strafe").clamp(-1., 1.);
         let load = v.cargo.total() as f32 / (v.cargo_capacity.max(1) as f32);
         let factor = (1. + 0.14 * v.kit("mobility"))
             * (1. - 0.14 * load)
@@ -588,7 +607,9 @@ impl Logistics {
         } else {
             top * acceleration * (if acceleration < 0. { 0.4 } else { 1. })
         };
-        let rate = if target.abs() < v.speed.abs() || target.signum() != v.speed.signum() {
+        let rate = if target == 0. {
+            cfg.accel * 0.48
+        } else if target.signum() != v.speed.signum() && v.speed != 0. {
             cfg.accel * 1.8
         } else {
             cfg.accel
@@ -603,7 +624,13 @@ impl Logistics {
         if !self.fit(i, v.x, v.z, yaw, scene, b) {
             yaw = v.yaw;
         }
-        let (mut x, mut z) = (v.x + yaw.sin() * speed * dt, v.z - yaw.cos() * speed * dt);
+        let grip = if v.kind == "mbt" { 10.0_f32 } else { 5.0 };
+        let course = if speed.abs() < 1.0 {
+            yaw
+        } else {
+            wrap(v.course + wrap(yaw - v.course) * (1. - (-grip * dt).exp()))
+        };
+        let (mut x, mut z) = (v.x + course.sin() * speed * dt, v.z - course.cos() * speed * dt);
         let mut impact = false;
         if let Some((index, point)) = self.obstruction(i, x, z, yaw, scene, b) {
             let approach = speed.abs();
@@ -617,26 +644,83 @@ impl Logistics {
                 };
                 let power = (approach * weight).min(235.);
                 let material = index.map(|n| scene[n].impact_material()).unwrap_or("metal");
-                events.push(json!({"type":"vehicleImpact","actor":p.id,"vehicleId":v.id,"kind":v.kind,"index":index,"material":material,
+                events.push(json!({"type":"vehicleImpact","actor":v.last_driver,"vehicleId":v.id,"kind":v.kind,"index":index,"material":material,
                     "strength":(power/180.).clamp(0.12,1.0),"power":power,"x":point[0],"y":point[1],"z":point[2],"ex":point[0],"ey":point[1],"ez":point[2]}));
                 impact = true;
             }
             x = v.x;
             z = v.z;
-            speed = 0.;
+            // Re-test the hull next tick after the match applies impact damage.
+            // Only a newly opened passage can carry the remaining momentum.
+            speed = if impact && index.is_some() { speed * 0.55 } else { 0. };
         }
         let v = &mut self.vehicles[i];
         if impact {
             v.impact_delay = 0.7;
         }
         let moved = distance(v.x, v.z, x, z);
+        v.advanced_this_tick = true;
         v.travel += moved * speed.signum();
         v.steering = turn;
-        v.fuel = (v.fuel - moved * cfg.burn * (1. + 0.09 * v.kit("mobility"))).max(0.);
+        if acceleration != 0. {
+            v.fuel = (v.fuel - moved * cfg.burn * (1. + 0.09 * v.kit("mobility"))).max(0.);
+        }
         v.x = x;
         v.z = z;
         v.speed = speed;
         v.yaw = yaw;
+        v.course = course;
+        if moved > 0. && speed.abs() >= 6. {
+            let hull = v.shape();
+            for &(id, px, pz) in &self.roster {
+                if Some(id) != v.last_driver && hull.intersects(px, pz, 0.34) {
+                    events.push(json!({"type":"runOver","target":id}));
+                }
+            }
+        }
+        events
+    }
+
+    pub(crate) fn coast(
+        &mut self,
+        dt: f32,
+        scene: &[Prop],
+        bounds: &Bounds,
+    ) -> Vec<(u32, String, Vec<Value>)> {
+        let mut impacts = Vec::new();
+        for i in 0..self.vehicles.len() {
+            let v = &self.vehicles[i];
+            if v.destroyed || v.driver.is_some() || v.advanced_this_tick || v.speed == 0. {
+                continue;
+            }
+            let Some(actor) = v.last_driver else { continue };
+            let events = self.advance_vehicle(i, 0., 0., dt, scene, bounds);
+            if !events.is_empty() {
+                impacts.push((actor, self.vehicles[i].team.clone(), events));
+            }
+        }
+        impacts
+    }
+
+    fn drive(
+        &mut self,
+        i: usize,
+        p: &mut Player,
+        input: &Value,
+        dt: f32,
+        scene: &[Prop],
+        b: &Bounds,
+    ) -> Vec<Value> {
+        let mut events = self.advance_vehicle(
+            i,
+            val(input, "forward").clamp(-1., 1.),
+            val(input, "strafe").clamp(-1., 1.),
+            dt,
+            scene,
+            b,
+        );
+        let v = &mut self.vehicles[i];
+        let (x, z, yaw, speed) = (v.x, v.z, v.yaw, v.speed);
         let turret_step = 1.28 * dt;
         v.turret_yaw = if matches!(v.kind.as_str(), "mbt" | "apc") {
             wrap(v.turret_yaw + wrap(p.yaw - v.turret_yaw).clamp(-turret_step, turret_step))
@@ -727,6 +811,23 @@ impl Logistics {
         } else {
             "Для заправки возьми топливо. Для ремонта нужны мастерская и 2 металла"
         });
+    }
+    pub(crate) fn debug_vehicle_service(&mut self, p: &mut Player) {
+        if !p.alive {
+            return;
+        }
+        let Some(i) = self.vehicle_near_matching(p, |v| !v.destroyed && v.team == p.team) else {
+            p.notice("Подойди к союзной машине");
+            return;
+        };
+        let v = &mut self.vehicles[i];
+        v.hp = v.max_hp;
+        v.fuel = v.max_fuel;
+        v.mg_ammo = v.mg_capacity;
+        if v.kind == "mbt" {
+            v.shells = MAX_TANK_SHELLS;
+        }
+        p.notice("Машина отремонтирована, топливо и боезапас пополнены");
     }
     fn upgrade(&mut self, p: &mut Player, scene: &[Prop], i: usize) {
         let v = &mut self.vehicles[i];
@@ -860,13 +961,13 @@ impl Logistics {
             return;
         }
         if let Some(v) = vehicle.filter(|v| v.mg_capacity > 0 && !v.destroyed) {
-            let shells_full = v.kind != "mbt" || v.shells >= 12;
+            let shells_full = v.kind != "mbt" || v.shells >= MAX_TANK_SHELLS;
             if shells_full && v.mg_ammo >= v.mg_capacity {
                 p.notice("Боекомплект полный");
                 return;
             }
             if v.kind == "mbt" {
-                v.shells = (v.shells + 3).min(12);
+                v.shells = (v.shells + 3).min(MAX_TANK_SHELLS);
             }
             v.mg_ammo = (v.mg_ammo + 28).min(v.mg_capacity);
             p.notice("Боекомплект машины пополнен");
@@ -911,7 +1012,6 @@ impl Logistics {
                     let v = &self.vehicles[i];
                     if let Some((x, z)) = self.safe_exit(v.x, v.z, v.yaw, p.id, scene, bounds) {
                         self.vehicles[i].driver = None;
-                        self.vehicles[i].speed = 0.;
                         p.x = x;
                         p.z = z;
                         p.moving = false;
@@ -923,6 +1023,7 @@ impl Logistics {
                     let v = &mut self.vehicles[i];
                     if !v.destroyed && v.driver.is_none() && v.team == p.team {
                         v.driver = Some(p.id);
+                        v.last_driver = Some(p.id);
                         p.x = v.x;
                         p.z = v.z;
                         p.build_mode = false;

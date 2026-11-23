@@ -1,6 +1,6 @@
 # Защита ветки main
 
-Конфигурация для импорта находится в [.github/main-ruleset.json](../.github/main-ruleset.json). Защиту включает владелец репозитория в настройках GitHub.
+Конфигурация для импорта находится в [.github/main-ruleset.json](../.github/main-ruleset.json). Для `main` действует [правило GitHub](https://github.com/athebyme/frontline-surge-server/settings/rules/27885060). Слияние проходит через PR после успешной проверки `server-test-build`. Список исключений пуст.
 
 1. Открой pull request в `main` и дождись успешного задания GitHub Actions `server-test-build`. При настройке GitHub использует проверки, которые успешно выполнялись в этом репозитории за последние семь дней.
 2. Открой [настройки правил репозитория](https://github.com/athebyme/frontline-surge-server/settings/rules). Если правило **main requires PR and CI** уже существует, открой его для сверки. Для первого включения выбери **New ruleset → Import a ruleset** и загрузи файл `.github/main-ruleset.json` из этой копии репозитория.

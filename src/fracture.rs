@@ -100,7 +100,8 @@ impl Cell {
             let c = self.center[i] - o[i];
             let half = self.size[i] * 0.5;
             if d[i].abs() < 0.000001 {
-                if c.abs() > half {
+                // Adjacent cell edges can differ by a few ulps at a panel seam.
+                if c.abs() > half + 1e-5 {
                     return None;
                 }
             } else {
