@@ -698,8 +698,23 @@ struct Shell {
 #[derive(Clone, Copy)]
 enum Strike {
     Infantry,
-    Machinegun,
+    Machinegun { vehicle_kind: &'static str },
     Shell { vehicle: u32, id: u64 },
+}
+const MOUNTED_MG_RANGE: f32 = 180.;
+#[derive(Clone, Copy, PartialEq)]
+enum Contact {
+    Range,
+    Ground,
+    Prop(usize),
+    Vehicle(usize),
+    Drone(u32),
+    Player(u32),
+}
+struct ShotContact {
+    distance: f32,
+    end: [f32; 3],
+    surface: Contact,
 }
 pub struct Match {
     ground: inventory::Ground,
@@ -1537,6 +1552,49 @@ impl Match {
             Strike::Infantry,
         );
     }
+    fn first_contact(
+        &self,
+        p: &Player,
+        o: [f32; 3],
+        d: [f32; 3],
+        range: f32,
+        ignore_vehicle: Option<u32>,
+    ) -> ShotContact {
+        let floor = if d[1] < -1e-6 { -o[1] / d[1] } else { f32::INFINITY };
+        let (solid, mut best) = self.ray(o, d, range.min(floor));
+        let mut surface = match solid {
+            Some(i) => Contact::Prop(i),
+            None if floor <= range => Contact::Ground,
+            None => Contact::Range,
+        };
+        if let Some((id, t)) = self.logistics.ray_except(o, d, best, Some(p.id), ignore_vehicle) {
+            if t < best {
+                best = t;
+                surface = Contact::Vehicle(id);
+            }
+        }
+        if let Some((id, t)) = self.drones.ray(o, d, best, &p.team) {
+            if t < best {
+                best = t;
+                surface = Contact::Drone(id);
+            }
+        }
+        for (&id, q) in &self.players {
+            if id != p.id && q.alive && self.logistics.driver_vehicle(id).is_none() {
+                if let Some(t) = q.ray(o, d, best) {
+                    if t < best {
+                        best = t;
+                        surface = Contact::Player(id);
+                    }
+                }
+            }
+        }
+        ShotContact {
+            distance: best,
+            end: [o[0] + d[0] * best, o[1] + d[1] * best, o[2] + d[2] * best],
+            surface,
+        }
+    }
     fn trace_shot(
         &mut self,
         p: &mut Player,
@@ -1547,85 +1605,39 @@ impl Match {
     ) -> bool {
         let stats = p.weapon.stats();
         let tank = matches!(kind, Strike::Shell { .. });
-        let mg = matches!(kind, Strike::Machinegun);
+        let mg = matches!(kind, Strike::Machinegun { .. });
         let ignore_vehicle = if let Strike::Shell { vehicle, .. } = kind {
             Some(vehicle)
         } else {
             None
         };
-        let floor = if d[1] < -1e-6 {
-            -o[1] / d[1]
-        } else {
-            f32::INFINITY
-        };
-        let (mut solid, mut best) = self.ray(o, d, range.min(floor));
-        let mut vehicle = None;
-        if let Some((id, t)) = self
-            .logistics
-            .ray_except(o, d, best, Some(p.id), ignore_vehicle)
-        {
-            if t < best {
-                best = t;
-                solid = None;
-                vehicle = Some(id);
-            }
-        }
-        let mut drone = None;
-        if let Some((id, t)) = self.drones.ray(o, d, best, &p.team) {
-            if t < best {
-                best = t;
-                solid = None;
-                vehicle = None;
-                drone = Some(id);
-            }
-        }
-        let mut victim = None;
-        for (&id, q) in &self.players {
-            if q.alive && self.logistics.driver_vehicle(id).is_none() {
-                if let Some(t) = q.ray(o, d, best) {
-                    if t < best {
-                        victim = Some(id);
-                        best = t;
-                    }
-                }
-            }
-        }
-        let end = [o[0] + d[0] * best, o[1] + d[1] * best, o[2] + d[2] * best];
-        let any_hit = victim.is_some()
-            || vehicle.is_some()
-            || drone.is_some()
-            || solid.is_some()
-            || floor <= range;
+        let ShotContact { distance: best, end, surface } = self.first_contact(p, o, d, range, ignore_vehicle);
+        let any_hit = surface != Contact::Range;
         if tank && !any_hit {
             return false;
         }
-        let weapon = if tank {
-            "tank"
-        } else if mg {
-            "vehicle_mg"
-        } else {
-            p.weapon.name()
+        let (weapon, vehicle_kind) = match kind {
+            Strike::Shell { .. } => ("tank", Some("mbt")),
+            Strike::Machinegun { vehicle_kind } => ("vehicle_mg", Some(vehicle_kind)),
+            Strike::Infantry => (p.weapon.name(), None),
         };
         let mut info = json!({"actor":p.id,"x":o[0],"y":o[1],"z":o[2],"ex":end[0],"ey":end[1],"ez":end[2],"weapon":weapon});
-        if victim.is_none() {
-            if vehicle.is_some() || drone.is_some() {
-                info["impactMaterial"] = "metal".into();
-            } else if let Some(i) = solid {
+        let material = match surface {
+            Contact::Vehicle(_) | Contact::Drone(_) => Some("metal"),
+            Contact::Ground => Some("earth"),
+            Contact::Prop(i) => {
                 let obj = &self.props[i];
-                info["impactMaterial"] = if matches!(
-                    obj.style.as_deref(),
-                    Some("shippingContainer" | "tankBattery")
-                ) || matches!(
-                    obj.kind.as_str(),
-                    "patrol4x4" | "cargo6x6" | "mbt" | "apc" | "scout_buggy"
-                ) {
-                    "metal".into()
+                if matches!(obj.style.as_deref(), Some("shippingContainer" | "tankBattery"))
+                    || matches!(obj.kind.as_str(), "patrol4x4" | "cargo6x6" | "mbt" | "apc" | "scout_buggy") {
+                    Some("metal")
                 } else {
-                    obj.kind.clone().into()
-                };
-            } else if floor <= range {
-                info["impactMaterial"] = "earth".into();
+                    Some(obj.kind.as_str())
+                }
             }
+            _ => None,
+        };
+        if let Some(material) = material {
+            info["impactMaterial"] = material.into();
         }
         if let Strike::Shell { id, vehicle } = kind {
             info["shellId"] = id.into();
@@ -1637,7 +1649,7 @@ impl Match {
         } else {
             self.scene_event("shot", info);
         }
-        if let Some(id) = victim {
+        if let Contact::Player(id) = surface {
             let head = end[1] > 1.53;
             self.harm(
                 p,
@@ -1655,8 +1667,9 @@ impl Match {
                 },
                 weapon,
                 head,
+                vehicle_kind,
             );
-        } else if let Some(id) = drone {
+        } else if let Contact::Drone(id) = surface {
             p.hit_confirm = 1.;
             if self.drones.hit(
                 id,
@@ -1672,7 +1685,7 @@ impl Match {
             } else {
                 self.event("hit", p, json!({"droneId":id,"weapon":weapon}));
             }
-        } else if let Some(key) = vehicle {
+        } else if let Contact::Vehicle(key) = surface {
             let d = if tank {
                 Damage::Tank
             } else {
@@ -1692,15 +1705,17 @@ impl Match {
             );
             let events = self.logistics.hit(key, impact, p.id, &p.team);
             self.ingest_logistics(events, p);
-        } else if let Some(i) = solid {
+        } else if let Contact::Prop(i) = surface {
             if tank {
                 self.damage_prop(i, end, Damage::Tank, 155., p);
+            } else if self.props[i].layout.is_some() {
+                self.damage_prop(i, end, Damage::Bullet(stats.hard), 0., p);
             }
         }
         any_hit
     }
 
-    pub(crate) fn harm(&mut self, p: &mut Player, id: u32, amount: f32, weapon: &str, head: bool) {
+    pub(crate) fn harm(&mut self, p: &mut Player, id: u32, amount: f32, weapon: &str, head: bool, vehicle_kind: Option<&str>) {
         let Some(mut q) = self.players.remove(&id) else {
             return;
         };
@@ -1746,7 +1761,11 @@ impl Match {
                 } else {
                     self.red += 1;
                 }
-                self.event("kill",p,json!({"target":q.id,"actorName":p.name,"targetName":q.name,"team":p.team,"head":head,"weapon":weapon,"assistIds":assists}));
+                let mut details = json!({"target":q.id,"actorName":p.name,"targetName":q.name,"team":p.team,"head":head,"weapon":weapon,"assistIds":assists});
+                if let Some(kind) = vehicle_kind {
+                    details["vehicleKind"] = kind.into();
+                }
+                self.event("kill", p, details);
                 if self.frag_limit > 0 && self.blue.max(self.red) >= self.frag_limit {
                     self.end_round();
                 }
@@ -2052,7 +2071,7 @@ impl Match {
             .filter(|(i, x, y, z)| self.blast_clear(o, [*x, *y, *z], None, Some(*i)))
             .collect();
         for (id, amount) in victims {
-            self.harm(&mut p, id, amount, "grenade", false);
+            self.harm(&mut p, id, amount, "grenade", false, None);
         }
         for (i, x, y, z) in hulls {
             let dist = (x - g.x).hypot(z - g.z).hypot(y - g.y);
@@ -2082,7 +2101,7 @@ impl Match {
             if kind == "runOver" {
                 if let Some(target) = ev["target"].as_u64().map(|id| id as u32) {
                     if self.logistics.driver_vehicle(target).is_none() {
-                        self.harm(p, target, 100., "ram", false);
+                        self.harm(p, target, 100., "ram", false, ev["vehicleKind"].as_str());
                     }
                 }
                 if self.phase == "ended" {
@@ -2108,17 +2127,10 @@ impl Match {
                 continue;
             }
             if kind == "mgFire" {
-                let yaw = num(&ev, "yaw", p.yaw, -100., 100.);
-                let pitch = num(&ev, "pitch", p.pitch, -1.0, 1.0);
-                let (sp, cp) = pitch.sin_cos();
-                let (sy, cy) = yaw.sin_cos();
-                self.trace_shot(
-                    p,
-                    [p.x, 2.08, p.z],
-                    [sy * cp, sp, -cy * cp],
-                    180.,
-                    Strike::Machinegun,
-                );
+                if let Some(mount) = self.logistics.machinegun_ray(p.id, p.pitch) {
+                    self.trace_shot(p, mount.origin, mount.direction, MOUNTED_MG_RANGE,
+                        Strike::Machinegun { vehicle_kind: mount.vehicle_kind });
+                }
                 continue;
             }
             if kind == "tankFire" {
@@ -2552,6 +2564,10 @@ impl Match {
                 if p.layout.is_some() {
                     o["broken"] = json!(p.fracture.broken);
                     o["revision"] = json!(p.fracture.revision);
+                    if p.fracture.scar_revision != 0 {
+                        o["scarRevision"] = json!(p.fracture.scar_revision);
+                        o["scars"] = json!(p.fracture.packed_scars());
+                    }
                 }
                 if let Some(hp) = p.hp {
                     o["hp"] = hp.into();
@@ -2570,6 +2586,10 @@ impl Match {
                 if p.layout.is_some() {
                     o["broken"] = json!(p.fracture.broken);
                     o["revision"] = json!(p.fracture.revision);
+                    if p.fracture.scar_revision != 0 {
+                        o["scarRevision"] = json!(p.fracture.scar_revision);
+                        o["scars"] = json!(p.fracture.packed_scars());
+                    }
                 }
                 o
             })
@@ -2579,6 +2599,10 @@ impl Match {
             .values()
             .map(|p| {
                 let mut out = json!(p);
+                if let Some(mount) = self.logistics.machinegun_ray(p.id, p.pitch) {
+                    let sight = self.first_contact(p, mount.origin, mount.direction, MOUNTED_MG_RANGE, None);
+                    out["mgSight"] = json!(sight.end);
+                }
                 p.arsenal.publish(p.weapon.slot(), &mut out);
                 out
             })
@@ -2638,6 +2662,68 @@ mod tests {
         act(&mut m, json!({"vehicle":true}));
         assert_eq!(m.snapshot()["players"][0]["vehicleId"], 1);
         m
+    }
+    #[test]
+    fn mounted_mg_sight_matches_the_fired_ray_and_names_the_fatal_weapon() {
+        for (kind, input) in [("mbt", "secondary"), ("apc", "shoot")] {
+            for range in [7., 28., 74.] {
+                let mut m = vehicle_lane(kind, json!([]));
+                let target = m.players.get_mut(&2).unwrap();
+                target.x = 0.;
+                target.z = 20. - range;
+                advance(&mut m, 2.5);
+                let pitch = (1.2_f32 - 2.08).atan2(range);
+                m.input(1, &json!({"yaw":0, "pitch":pitch}));
+                m.step(0.05);
+                let state = m.snapshot();
+                assert!(state["players"][1].get("mgSight").is_none());
+                let sight = &state["players"][0]["mgSight"];
+                let z = sight[2].as_f64().unwrap() as f32;
+                assert!((z - (20. - range + 0.39)).abs() < 0.003);
+                assert!((1.1..1.3).contains(&sight[1].as_f64().unwrap()));
+                for _ in 0..12 {
+                    m.input(1, &json!({input:true, "yaw":0, "pitch":pitch}));
+                    m.step(0.05);
+                }
+                let shot = m.events.iter().find(|e| e["type"] == "shot").unwrap();
+                assert_eq!(*sight, json!([shot["ex"], shot["ey"], shot["ez"]]));
+                let kill = m.events.iter().find(|e| e["type"] == "kill").unwrap();
+                assert_eq!(kill["weapon"], "vehicle_mg");
+                assert_eq!(kill["vehicleKind"], kind);
+                assert_eq!(kill["targetName"], "Other");
+            }
+        }
+    }
+    #[test]
+    fn mounted_mg_marks_near_cover_and_ground_using_actual_turret_rotation() {
+        let mut m = vehicle_lane("mbt", json!([{
+            "kind":"fence","x":0,"z":12,"w":4.,"h":4.,"d":0.4,"solid":true
+        }]));
+        {
+            let target = m.players.get_mut(&2).unwrap();
+            target.x = 0.;
+            target.z = -10.;
+        }
+        advance(&mut m, 2.5);
+        for (yaw, pitch, material) in [(0., -0.03, "fence"), (1.5, -0.68, "earth")] {
+            m.input(1, &json!({"yaw":yaw,"pitch":pitch}));
+            m.step(0.05);
+            let state = m.snapshot();
+            let actual = state["vehicles"][0]["turretYaw"].as_f64().unwrap();
+            if yaw > 0. {
+                assert!((actual - yaw).abs() > 1.);
+            }
+            // Hold that attained heading on the firing tick so the sight and
+            // shot refer to the same pose, even while the view was looking away.
+            m.input(1, &json!({"yaw":actual,"pitch":pitch,"secondary":true}));
+            m.step(0.05);
+            let shot = m.events.iter().rev().find(|e| e["type"] == "shot").unwrap();
+            assert_eq!(shot["impactMaterial"], material);
+            assert_eq!(state["players"][0]["mgSight"], json!([shot["ex"], shot["ey"], shot["ez"]]));
+            assert_eq!(m.players[&2].hp, 100.);
+            m.input(1, &json!({"yaw":actual,"pitch":pitch}));
+            advance(&mut m, 0.2);
+        }
     }
     #[test]
     fn released_vehicle_rolls_to_a_stop_and_uses_the_same_travel_on_all_snapshots() {
@@ -2899,6 +2985,23 @@ mod tests {
                 assert!(m.ray([a.x, EYE, a.z], [dx / d, 0., dz / d], d).0.is_some());
             }
         }
+    }
+    #[test]
+    fn bullet_marks_survive_late_join_and_clear_on_round_reset() {
+        let mut m = skirmish(json!([{"kind":"wall","x":0,"z":1,"w":5,"h":3,"d":0.65,"solid":true,"hp":250.}]));
+        advance(&mut m, 2.5);
+        shoot(&mut m, 0., 0.);
+        let snapshot = m.snapshot();
+        let facade = &snapshot["propChanges"][0];
+        assert!(facade["scars"].as_array().unwrap().len() >= 2);
+        assert_eq!(facade["revision"], 0);
+        assert_eq!(facade["hp"], 250.);
+        m.add_player(3, "Late");
+        assert_eq!(m.snapshot()["propChanges"][0], *facade);
+        m.remaining = 0.05;
+        advance(&mut m, 10.5);
+        assert!(m.round > snapshot["round"].as_u64().unwrap() as u32);
+        assert!(m.snapshot()["propChanges"].as_array().unwrap().is_empty());
     }
     #[test]
     fn combat_authority_team_shield_hit_scoring_and_respawn() {

@@ -1,7 +1,7 @@
 //! Shared building geometry. The same occupied cells drive drawing, shots and passage on both peers.
 //! Coordinates use metres, +Y up; the centre of the ground footprint is the local origin.
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Material {
@@ -64,12 +64,50 @@ pub struct Cell {
     pub size: [f32; 3],
     pub material: Material,
 }
+// Small surface scars are sent on the reliable map channel. Keep only the most
+// recent scars per building so sustained fire cannot inflate late-join snapshots.
+const MAX_SCARS: usize = 48;
+#[derive(Clone, Copy, Debug)]
+struct Scar {
+    id: u16,
+    stage: u8,
+    faces: u8,
+}
 #[derive(Clone, Debug, Default)]
 pub struct FractureState {
     pub broken: BTreeSet<u16>,
     pub revision: u32,
+    pub scar_revision: u32,
+    scars: VecDeque<Scar>,
     // Only touched, surviving cells need HP storage.
     wear: BTreeMap<u16, f32>,
+}
+impl FractureState {
+    // Bits 0..1 = stage, bits 2..7 = affected faces, high bits = cell.
+    pub fn packed_scars(&self) -> Vec<u32> {
+        self.scars
+            .iter()
+            .map(|s| ((s.id as u32) << 8) | ((s.faces as u32) << 2) | s.stage as u32)
+            .collect()
+    }
+    fn scar(&mut self, id: u16, faces: u8, stage: u8) -> bool {
+        if let Some(scar) = self.scars.iter_mut().find(|s| s.id == id) {
+            let next = (scar.stage.max(stage), scar.faces | faces);
+            if next == (scar.stage, scar.faces) {
+                return false;
+            }
+            (scar.stage, scar.faces) = next;
+        } else {
+            if self.scars.len() == MAX_SCARS {
+                self.scars.pop_front();
+            }
+            self.scars.push_back(Scar { id, stage, faces });
+        }
+        true
+    }
+}
+fn masonry(mat: Material) -> bool {
+    matches!(mat, Material::Brick | Material::Stone | Material::Tile)
 }
 #[derive(Default, Debug)]
 pub struct Change {
@@ -294,10 +332,63 @@ impl Layout {
             .map(|(i, _)| i as u16)
             .collect()
     }
+    fn surface_impact(&self, state: &mut FractureState, point: [f32; 3]) -> Change {
+        let Some((index, cell)) = self
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !state.broken.contains(&(*i as u16)))
+            .min_by(|a, b| a.1.distance2(point).total_cmp(&b.1.distance2(point)))
+        else {
+            return Change::default();
+        };
+        if cell.distance2(point) > 0.025 || !masonry(cell.material) {
+            return Change::default();
+        }
+        let offset: [f32; 3] = std::array::from_fn(|k| (point[k] - cell.center[k]) / cell.size[k]);
+        let axis = (0..3)
+            .max_by(|&a, &b| offset[a].abs().total_cmp(&offset[b].abs()))
+            .unwrap();
+        let face = 1 << (2 * axis + usize::from(offset[axis] < 0.));
+        let id = index as u16;
+        let old = state
+            .scars
+            .iter()
+            .find(|s| s.id == id && s.faces & face != 0)
+            .map_or(0, |s| s.stage);
+        let stage = (old + 1).clamp(2, 3);
+        let mut changed = state.scar(id, face, stage);
+        // Trace only through shared solid edges on this face of the facade.
+        let mut neighbors: Vec<_> = self.neighbors[index]
+            .iter()
+            .map(|n| n.0)
+            .filter(|&j| {
+                let n = &self.cells[j as usize];
+                !state.broken.contains(&j)
+                    && masonry(n.material)
+                    && (n.center[axis] - cell.center[axis]).abs() < 0.01
+            })
+            .collect();
+        neighbors.sort_by(|&a, &b| {
+            self.cells[a as usize]
+                .distance2(point)
+                .total_cmp(&self.cells[b as usize].distance2(point))
+        });
+        for neighbor in neighbors.into_iter().take(2) {
+            changed |= state.scar(neighbor, face, stage - 1);
+        }
+        if changed {
+            state.scar_revision = state.scar_revision.wrapping_add(1);
+        }
+        Change {
+            touched: changed,
+            ..Default::default()
+        }
+    }
     pub fn damage(&self, state: &mut FractureState, p: [f32; 3], source: Damage) -> Change {
         let mut out = Change::default();
         let radius: f32 = match source {
-            Damage::Bullet(_) => return Change::default(),
+            Damage::Bullet(_) => return self.surface_impact(state, p),
             Damage::Ram(force) => (0.9 + force * 0.010).clamp(1.1, 3.1),
             Damage::Grenade => 2.55,
             Damage::Tank => 2.85,
@@ -310,6 +401,7 @@ impl Layout {
             .map(|(i, c)| (i as u16, c.distance2(p)))
             .filter(|(_, d)| *d <= radius * radius);
         let hits: Vec<_> = candidates.collect();
+        let mut scarred = false;
         for (id, d2) in hits {
             let mat = self.cells[id as usize].material;
             let amount = mat.received(source) * (1. - d2.sqrt() / radius).max(0.);
@@ -323,6 +415,9 @@ impl Layout {
                 state.wear.remove(&id);
                 state.broken.insert(id);
                 out.removed.push(id);
+            } else if masonry(mat) && *value > mat.strength() * 0.14 {
+                let stage = (1. + 3. * *value / mat.strength()).min(3.) as u8;
+                scarred |= state.scar(id, 63, stage);
             }
         }
         if !out.removed.is_empty() {
@@ -331,8 +426,14 @@ impl Layout {
                 state.broken.insert(id);
                 state.wear.remove(&id);
             }
+            let before = state.scars.len();
+            state.scars.retain(|s| !state.broken.contains(&s.id));
+            scarred |= before != state.scars.len();
             out.removed.extend_from_slice(&out.collapsed);
             state.revision = state.revision.wrapping_add(1);
+        }
+        if scarred {
+            state.scar_revision = state.scar_revision.wrapping_add(1);
         }
         out
     }
@@ -340,6 +441,27 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn masonry_impacts_spread_on_one_face_without_removing_solid_cells() {
+        let l = Layout::new("wall", 8., 3., 0.8, 0).unwrap();
+        let mut state = FractureState::default();
+        let p = [0.33, 1.15, 0.4];
+        assert!(l.damage(&mut state, p, Damage::Bullet(10.)).touched);
+        assert_eq!(state.scars.len(), 3);
+        assert!(state.scars.iter().all(|s| s.faces == 1 << 4));
+        assert_eq!(state.scars.iter().filter(|s| s.stage == 2).count(), 1);
+        l.damage(&mut state, p, Damage::Bullet(10.));
+        let revision = state.scar_revision;
+        for _ in 0..200 {
+            l.damage(&mut state, p, Damage::Bullet(10.));
+        }
+        assert_eq!((state.scar_revision, state.revision), (revision, 0));
+        assert!(l.ray(&state, [0.33, 1.15, 3.], [0., 0., -1.], 5.).is_some());
+        l.damage(&mut state, p, Damage::Tank);
+        assert!(!state.broken.is_empty());
+        assert!(state.scars.iter().all(|s| !state.broken.contains(&s.id)));
+        assert!(!state.packed_scars().is_empty());
+    }
     #[test]
     fn metal_resists_small_arms_and_an_isolated_grenade_but_a_shell_opens_it() {
         let l = Layout::new("barn", 9., 5., 8., 0).unwrap();

@@ -40,7 +40,7 @@ impl Match {
             .filter(|(_, amt)| *amt > 0.)
             .collect::<Vec<_>>();
         for (id, amount) in infantry {
-            self.harm(operator, id, amount, "drone_pulse", false);
+            self.harm(operator, id, amount, "drone_pulse", false, None);
         }
         for (i, x, y, z) in self.logistics.blast_targets(origin[0], origin[2], RADIUS) {
             let amount = falloff(origin, [x, y, z], &self.props) * 86.;

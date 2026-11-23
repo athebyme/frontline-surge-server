@@ -43,7 +43,7 @@ sha256sum -c SHA256SUMS
 ./frontline-server --version
 ```
 
-При утрате права исполнения после распаковки выполни `chmod +x frontline-server`. Ожидаемая строка для этой версии — `Frontline Surge 0.5.1 · protocol 5`.
+При утрате права исполнения после распаковки выполни `chmod +x frontline-server`. Ожидаемая строка для этой версии — `Frontline Surge 0.5.2 · protocol 5`.
 
 ## Установить службу на Debian с systemd
 

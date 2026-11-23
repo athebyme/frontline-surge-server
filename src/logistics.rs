@@ -218,7 +218,28 @@ pub(crate) struct Logistics {
     used: HashMap<u32, f32>,
     factories: Vec<(usize, String, String, f32, f32, f32, f32, f32)>,
 }
+/// The same server-owned mount supplies both the HUD sight and each MG shot.
+pub(crate) struct MachinegunRay {
+    pub origin: [f32; 3],
+    pub direction: [f32; 3],
+    pub vehicle_kind: &'static str,
+}
 impl Logistics {
+    pub(crate) fn machinegun_ray(&self, driver: u32, pitch: f32) -> Option<MachinegunRay> {
+        let v = &self.vehicles[self.driver_vehicle(driver)?];
+        let vehicle_kind = match v.kind.as_str() {
+            "mbt" => "mbt",
+            "apc" => "apc",
+            _ => return None,
+        };
+        let (sp, cp) = pitch.clamp(-0.7, 0.7).sin_cos();
+        let (sy, cy) = v.turret_yaw.sin_cos();
+        Some(MachinegunRay {
+            origin: [v.x, 2.08, v.z],
+            direction: [sy * cp, sp, -cy * cp],
+            vehicle_kind,
+        })
+    }
     pub(crate) fn hull_kind(&self, index: usize) -> Option<&str> {
         self.vehicles.get(index).map(|v| v.kind.as_str())
     }
@@ -674,7 +695,7 @@ impl Logistics {
             let hull = v.shape();
             for &(id, px, pz) in &self.roster {
                 if Some(id) != v.last_driver && hull.intersects(px, pz, 0.34) {
-                    events.push(json!({"type":"runOver","target":id}));
+                    events.push(json!({"type":"runOver","target":id,"vehicleKind":v.kind}));
                 }
             }
         }
@@ -748,7 +769,7 @@ impl Logistics {
             v.mg_ammo -= 1;
             v.mg_delay = 0.12;
             p.shield = 0.;
-            events.push(json!({"type":"mgFire","actor":p.id,"x":x,"y":2.08,"z":z,"yaw":v.turret_yaw,"pitch":p.pitch.clamp(-0.7,0.7),"vehicleId":v.id}));
+            events.push(json!({"type":"mgFire"}));
         }
         events
     }
